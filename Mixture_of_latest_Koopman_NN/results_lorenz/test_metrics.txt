@@ -1,0 +1,9 @@
+Test Set Metrics
+==================================================
+mse: 3.328290
+rmse: 1.824360
+mae: 1.331142
+mean_phase_error: 2.601671
+max_phase_error: 6.127674
+
+Test Loss: 0.332404
