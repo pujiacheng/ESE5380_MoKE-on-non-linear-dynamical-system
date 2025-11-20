@@ -21,30 +21,36 @@ import numpy as np
 
 class MLPEncoder(nn.Module):
     """Encoder network: maps state x to latent representation z"""
-    def __init__(self, n_in=2, n_latent=6):
+
+    def __init__(self, n_in=2, n_latent=6, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_in, 128),
+            nn.Linear(n_in, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Linear(128, n_latent)
+            nn.Linear(hidden, n_latent)
         )
-    
+
     def forward(self, x):
         return self.net(x)
 
 
 class MLPDecoder(nn.Module):
     """Decoder network: maps latent representation z back to state x"""
-    def __init__(self, n_latent=6, n_out=2):
+
+    def __init__(self, n_latent=6, n_out=2, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_latent, 128),
+            nn.Linear(n_latent, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Linear(128, n_out)
+            nn.Linear(hidden, n_out)
         )
     
     def forward(self, z):
@@ -53,12 +59,14 @@ class MLPDecoder(nn.Module):
 
 class ObservablesNet(nn.Module):
     """Observables network: maps state x to observables g(x) for eDMD"""
-    def __init__(self, n_in=2, p=20):
+
+    def __init__(self, n_in=2, p=20, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_in, 64),
+            nn.Linear(n_in, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Linear(64, p)
+            nn.Linear(hidden, p)
         )
     
     def forward(self, x):
@@ -72,20 +80,26 @@ class KoopmanAE(nn.Module):
     Args:
         n_x: dimension of state space
         n_z: dimension of latent space
-        p: dimension of observables space
+        p: dimension of observables space (only used if use_observables=True)
+        use_observables: whether to use observables network (default: False)
     """
-    def __init__(self, n_x=2, n_z=6, p=20):
+    def __init__(self, n_x=2, n_z=20, p=20, use_observables=False):
         super().__init__()
+        self.use_observables = use_observables
         self.encoder = MLPEncoder(n_in=n_x, n_latent=n_z)
         self.decoder = MLPDecoder(n_latent=n_z, n_out=n_x)
-        self.obs = ObservablesNet(n_in=n_x, p=p)
+        
+        if self.use_observables:
+            self.obs = ObservablesNet(n_in=n_x, p=p)
+            # eDMD linear map on observables (learnable)
+            self.A_g = nn.Parameter(torch.eye(p))
+        else:
+            self.obs = None
+            self.A_g = None
         
         # Bidirectional linear maps in latent space
         self.A_f = nn.Parameter(torch.eye(n_z) + 0.01*torch.randn(n_z, n_z))
         self.A_b = nn.Parameter(torch.eye(n_z) + 0.01*torch.randn(n_z, n_z))
-        
-        # eDMD linear map on observables (learnable)
-        self.A_g = nn.Parameter(torch.eye(p))
     
     def forward(self, x):
         """
@@ -98,12 +112,38 @@ class KoopmanAE(nn.Module):
             dict with keys:
                 - z: latent representation
                 - x_rec: reconstructed state
-                - g: observables
+                - g: observables (None if use_observables=False)
         """
         z = self.encoder(x)
         x_rec = self.decoder(z)
-        g = self.obs(x)
+        if self.use_observables:
+            g = self.obs(x)
+        else:
+            g = None
         return dict(z=z, x_rec=x_rec, g=g)
+
+    def sparsity_loss(self, mode: str = "l1"):
+        """
+        Compute sparsity-promoting penalty over encoder/decoder weights.
+        Observables network is excluded if disabled.
+
+        Args:
+            mode: 'l1' (default) or 'l2'
+        """
+        penalty = torch.zeros(1, device=self.A_f.device)
+        modules = [self.encoder, self.decoder]
+        if self.use_observables and self.obs is not None:
+            modules.append(self.obs)
+        
+        for module in modules:
+            for name, param in module.named_parameters():
+                if "weight" not in name:
+                    continue
+                if mode == "l2":
+                    penalty = penalty + torch.sum(param**2)
+                else:
+                    penalty = penalty + torch.sum(param.abs())
+        return penalty.squeeze()
 
 
 def spectral_radius_penalty(A, iters=10, target=1.05):
