@@ -13,6 +13,8 @@ Generates CSV output with trajectory number, time step, state variables, and der
 import numpy as np
 import pandas as pd
 import argparse
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 
 # ============================================================================
@@ -34,11 +36,15 @@ def rk4_step(f, t, y, dt):
 # ============================================================================
 def duffing_rhs(t, y, alpha=1.0, beta=1.0, delta=0.0, gamma=0.0, omega=0.0):
     """
-    Duffing oscillator: x'' = -delta*x' - alpha*x - beta*x^3 + gamma*cos(omega*t)
-    Default: x'' = x - x^3 (conservative, bistable)
+    Bistable Duffing oscillator: x'' = -delta*x' + alpha*x - beta*x^3 + gamma*cos(omega*t)
+    
+    This creates a double-well potential V(x) = -alpha*x^2/2 + beta*x^4/4
+    with stable equilibria at x = ±sqrt(alpha/beta) when alpha > 0 and beta > 0.
+    
+    Default: x'' = x - x^3 (conservative, bistable with wells at x = ±1)
     """
     x, xdot = y
-    xddot = -delta*xdot - alpha*x - beta*(x**3) + gamma*np.cos(omega*t)
+    xddot = -delta*xdot + alpha*x - beta*(x**3) + gamma*np.cos(omega*t)
     return np.array([xdot, xddot])
 
 
@@ -395,10 +401,157 @@ def main():
     # Export to CSV
     df = export_to_csv(t, trajs, derivatives, args.system, args.output)
     
+    # Visualize trajectories
+    visualize_trajectories(t, trajs, args.system, args.output)
+    
     print(f"\nSimulation complete!")
     print(f"System: {args.system}")
     print(f"Parameters: {system_params}")
     print(f"Output saved to: {args.output}")
+
+
+# ============================================================================
+# Visualization
+# ============================================================================
+def visualize_trajectories(t, trajs, system_type, output_path, n_samples=5):
+    """
+    Visualize trajectories for different system types
+    
+    Args:
+        t: time array
+        trajs: trajectory array (n_traj, n_steps, n_dim)
+        system_type: system type string
+        output_path: path to save visualization (will create .png version)
+        n_samples: number of sample trajectories to plot (default: 5)
+    """
+    n_traj, n_steps, n_dim = trajs.shape
+    n_samples = min(n_samples, n_traj)
+    
+    # Select random sample trajectories
+    sample_indices = np.random.choice(n_traj, n_samples, replace=False)
+    
+    # Create figure based on system type
+    if system_type in ['duffing', 'vanderpol']:
+        # 2D systems: phase space and time series
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # Phase space plot
+        ax1 = axes[0]
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax1.plot(traj[:, 0], traj[:, 1], alpha=0.7, linewidth=1.5)
+        ax1.set_xlabel('x', fontsize=12)
+        ax1.set_ylabel('xdot', fontsize=12)
+        ax1.set_title(f'{system_type.capitalize()} Oscillator: Phase Space (x vs xdot)', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend([f'Trajectory {i+1}' for i in range(n_samples)], loc='best')
+        
+        # Time series plot
+        ax2 = axes[1]
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax2.plot(t, traj[:, 0], alpha=0.7, linewidth=1.5, label=f'x (traj {sample_indices.tolist().index(idx)+1})')
+            ax2.plot(t, traj[:, 1], alpha=0.7, linewidth=1.5, linestyle='--', 
+                    label=f'xdot (traj {sample_indices.tolist().index(idx)+1})')
+        ax2.set_xlabel('Time', fontsize=12)
+        ax2.set_ylabel('State Variables', fontsize=12)
+        ax2.set_title(f'{system_type.capitalize()} Oscillator: Time Series', fontsize=14)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='best', ncol=2)
+        
+    elif system_type == 'lorenz':
+        # 3D system: 3D plot and projections
+        fig = plt.figure(figsize=(16, 5))
+        
+        # 3D trajectory
+        ax1 = fig.add_subplot(131, projection='3d')
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax1.plot(traj[:, 0], traj[:, 1], traj[:, 2], alpha=0.7, linewidth=1.5)
+        ax1.set_xlabel('x', fontsize=10)
+        ax1.set_ylabel('y', fontsize=10)
+        ax1.set_zlabel('z', fontsize=10)
+        ax1.set_title('Lorenz Attractor: 3D Trajectory', fontsize=12)
+        
+        # XY projection
+        ax2 = fig.add_subplot(132)
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax2.plot(traj[:, 0], traj[:, 1], alpha=0.7, linewidth=1.5)
+        ax2.set_xlabel('x', fontsize=10)
+        ax2.set_ylabel('y', fontsize=10)
+        ax2.set_title('XY Projection', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        
+        # Time series
+        ax3 = fig.add_subplot(133)
+        for idx in sample_indices[:3]:  # Show fewer for clarity
+            traj = trajs[idx]
+            ax3.plot(t, traj[:, 0], alpha=0.7, label=f'x (traj {sample_indices.tolist().index(idx)+1})')
+            ax3.plot(t, traj[:, 1], alpha=0.7, label=f'y (traj {sample_indices.tolist().index(idx)+1})')
+            ax3.plot(t, traj[:, 2], alpha=0.7, label=f'z (traj {sample_indices.tolist().index(idx)+1})')
+        ax3.set_xlabel('Time', fontsize=10)
+        ax3.set_ylabel('State Variables', fontsize=10)
+        ax3.set_title('Time Series', fontsize=12)
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc='best')
+        
+    elif system_type == 'double_pendulum':
+        # 4D system: angles and phase spaces
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Theta1 vs Theta1_dot phase space
+        ax1 = axes[0, 0]
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax1.plot(traj[:, 0], traj[:, 1], alpha=0.7, linewidth=1.5)
+        ax1.set_xlabel('theta1', fontsize=12)
+        ax1.set_ylabel('theta1_dot', fontsize=12)
+        ax1.set_title('First Pendulum: Phase Space', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        
+        # Theta2 vs Theta2_dot phase space
+        ax2 = axes[0, 1]
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax2.plot(traj[:, 2], traj[:, 3], alpha=0.7, linewidth=1.5)
+        ax2.set_xlabel('theta2', fontsize=12)
+        ax2.set_ylabel('theta2_dot', fontsize=12)
+        ax2.set_title('Second Pendulum: Phase Space', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        
+        # Theta1 vs Theta2
+        ax3 = axes[1, 0]
+        for idx in sample_indices:
+            traj = trajs[idx]
+            ax3.plot(traj[:, 0], traj[:, 2], alpha=0.7, linewidth=1.5)
+        ax3.set_xlabel('theta1', fontsize=12)
+        ax3.set_ylabel('theta2', fontsize=12)
+        ax3.set_title('Angle Configuration Space', fontsize=12)
+        ax3.grid(True, alpha=0.3)
+        
+        # Time series
+        ax4 = axes[1, 1]
+        for idx in sample_indices[:3]:  # Show fewer for clarity
+            traj = trajs[idx]
+            ax4.plot(t, traj[:, 0], alpha=0.7, label=f'theta1 (traj {sample_indices.tolist().index(idx)+1})')
+            ax4.plot(t, traj[:, 2], alpha=0.7, linestyle='--', 
+                    label=f'theta2 (traj {sample_indices.tolist().index(idx)+1})')
+        ax4.set_xlabel('Time', fontsize=12)
+        ax4.set_ylabel('Angles', fontsize=12)
+        ax4.set_title('Time Series: Angles', fontsize=12)
+        ax4.grid(True, alpha=0.3)
+        ax4.legend(loc='best')
+    
+    plt.tight_layout()
+    
+    # Save figure
+    viz_path = output_path.replace('.csv', '_visualization.png')
+    plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+    print(f"Visualization saved to: {viz_path}")
+    
+    # Show plot
+    plt.show()
 
 
 # ============================================================================
