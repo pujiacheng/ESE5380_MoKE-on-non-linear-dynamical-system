@@ -72,15 +72,15 @@ def load_data_from_csv(csv_path, state_columns=None, traj_id_column=None, time_c
         for traj_id in traj_ids:
             traj_data = df[df[traj_id_column] == traj_id][state_columns].values
             if len(traj_data) >= 3:  # Need at least 3 points for triplets
-                trajs.append(traj_data)
-        trajs = np.array(trajs, dtype=object)
+                trajs.append(traj_data.astype(np.float32))
+        
         # Convert to regular array if all trajectories have same length
         try:
             trajs = np.stack(trajs)
         except ValueError:
             # Trajectories have different lengths, pad or truncate
             min_len = min(len(t) for t in trajs)
-            trajs = np.array([t[:min_len] for t in trajs])
+            trajs = np.stack([t[:min_len] for t in trajs])
         print(f"Found {len(trajs)} trajectories")
     else:
         # Single trajectory
@@ -190,11 +190,14 @@ def compute_loss_batch(model, x0, x1, x2, all_X, device, n_x, n_z,
     z_pred2 = z_pred @ model.A_f.T
     loss_ms = mse(z_pred2, z2)
     
-    # eDMD observables regression
-    g0 = out0['g']
-    g1 = out1['g']
-    g_pred = g0 @ model.A_g.T
-    loss_edmd = mse(g_pred, g1)
+    # eDMD observables regression (only if observables are enabled)
+    if model.use_observables and out0['g'] is not None:
+        g0 = out0['g']
+        g1 = out1['g']
+        g_pred = g0 @ model.A_g.T
+        loss_edmd = mse(g_pred, g1)
+    else:
+        loss_edmd = torch.tensor(0.0, device=device)
     
     # Bidirectional constraint
     Id = torch.eye(model.A_f.shape[0], device=device)
@@ -236,7 +239,7 @@ def compute_loss_batch(model, x0, x1, x2, all_X, device, n_x, n_z,
     loss_spec = spectral_radius_penalty(model.A_f, iters=8, target=1.1)
     
     # Sparsity
-    sparsity_term = sum(param.norm(1) for param in model.obs.parameters())
+    sparsity_term = model.sparsity_loss(mode="l1")
     
     # Total loss
     loss = (lam_rec * loss_rec + lam_lin * loss_lin + lam_ms * loss_ms +
@@ -257,7 +260,7 @@ def compute_loss_batch(model, x0, x1, x2, all_X, device, n_x, n_z,
 
 def train_model(model, train_loader, val_loader, all_X_train, device, n_epochs=40, 
                 batch_size=256, hankel_batch_size=64, hankel_Tseq=8, L=4, 
-                n_x=2, n_z=6, save_dir='./'):
+                n_x=2, n_z=20, save_dir='./'):
     """
     Train the Koopman Autoencoder model with validation
     
@@ -274,12 +277,11 @@ def train_model(model, train_loader, val_loader, all_X_train, device, n_epochs=4
         L: Hankel window length
         n_x: state dimension
         n_z: latent dimension
-        save_dir: directory to save model checkpoints
-    
-    Returns:
-        train_log: list of training losses per epoch
-        val_log: list of validation losses per epoch
+        save_dir: directory to save model checkpoints (will be created if doesn't exist)
     """
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     train_log = []
@@ -410,8 +412,8 @@ def main():
                        help='Ratio of data for validation (default: 0.15)')
     parser.add_argument('--test_ratio', type=float, default=0.15,
                        help='Ratio of data for testing (default: 0.15)')
-    parser.add_argument('--n_z', type=int, default=6,
-                       help='Latent dimension (default: 6)')
+    parser.add_argument('--n_z', type=int, default=None,
+                       help='Latent dimension (default: 10×state_dim, auto-computed)')
     parser.add_argument('--p', type=int, default=20,
                        help='Observables dimension (default: 20)')
     parser.add_argument('--n_epochs', type=int, default=40,
@@ -443,39 +445,42 @@ def main():
         time_column=args.time_column
     )
     
-    # Prepare data triplets
-    xt, xt1, xt2 = prepare_data_from_trajectories(trajs)
+    # Compute latent dimension: 10 × state dimension (or use provided value)
+    if args.n_z is None:
+        n_z = 10 * n_x
+        print(f"Auto-computing latent dimension: n_z = 10 × {n_x} = {n_z}")
+    else:
+        n_z = args.n_z
+        print(f"Using provided latent dimension: n_z = {n_z}")
     
-    # Split into train/val/test
-    # First split: train vs (val+test)
-    train_size = int(len(xt) * args.train_ratio)
-    val_test_size = len(xt) - train_size
+    # Split trajectories temporally (chronologically) to avoid data leakage
+    # For each trajectory: early time steps -> train, middle -> val, late -> test
+    n_traj, n_steps, n_x = trajs.shape
     
-    indices = np.random.permutation(len(xt))
-    train_indices = indices[:train_size]
-    val_test_indices = indices[train_size:]
+    # Calculate split points for each trajectory
+    train_end = int(n_steps * args.train_ratio)
+    val_end = int(n_steps * (args.train_ratio + args.val_ratio))
     
-    # Second split: val vs test
-    val_size = int(len(val_test_indices) * args.val_ratio / (args.val_ratio + args.test_ratio))
-    val_indices = val_test_indices[:val_size]
-    test_indices = val_test_indices[val_size:]
+    # Split each trajectory temporally
+    train_trajs = trajs[:, :train_end, :]  # Early time steps
+    val_trajs = trajs[:, train_end:val_end, :]  # Middle time steps
+    test_trajs = trajs[:, val_end:, :]  # Late time steps
     
-    xt_train = xt[train_indices]
-    xt1_train = xt1[train_indices]
-    xt2_train = xt2[train_indices]
+    print(f"\nTemporal split per trajectory:")
+    print(f"  Train: steps 0 to {train_end-1} ({train_end/n_steps*100:.1f}%)")
+    print(f"  Val:   steps {train_end} to {val_end-1} ({(val_end-train_end)/n_steps*100:.1f}%)")
+    print(f"  Test:  steps {val_end} to {n_steps-1} ({(n_steps-val_end)/n_steps*100:.1f}%)")
     
-    xt_val = xt[val_indices]
-    xt1_val = xt1[val_indices]
-    xt2_val = xt2[val_indices]
+    # Prepare triplets from each split
+    xt_train, xt1_train, xt2_train = prepare_data_from_trajectories(train_trajs)
+    xt_val, xt1_val, xt2_val = prepare_data_from_trajectories(val_trajs)
+    xt_test, xt1_test, xt2_test = prepare_data_from_trajectories(test_trajs)
     
-    xt_test = xt[test_indices]
-    xt1_test = xt1[test_indices]
-    xt2_test = xt2[test_indices]
-    
-    print(f"\nData split:")
-    print(f"  Training:   {len(xt_train)} samples ({len(xt_train)/len(xt)*100:.1f}%)")
-    print(f"  Validation: {len(xt_val)} samples ({len(xt_val)/len(xt)*100:.1f}%)")
-    print(f"  Test:       {len(xt_test)} samples ({len(xt_test)/len(xt)*100:.1f}%)")
+    total_samples = len(xt_train) + len(xt_val) + len(xt_test)
+    print(f"\nData split (temporal, no shuffling):")
+    print(f"  Training:   {len(xt_train)} samples ({len(xt_train)/total_samples*100:.1f}%)")
+    print(f"  Validation: {len(xt_val)} samples ({len(xt_val)/total_samples*100:.1f}%)")
+    print(f"  Test:       {len(xt_test)} samples ({len(xt_test)/total_samples*100:.1f}%)")
     
     # Create data loaders
     train_loader = DataLoader(
@@ -498,8 +503,8 @@ def main():
     all_X_train = torch.cat([xt_train, xt1_train, xt2_train], dim=0)
     
     # Create model
-    model = KoopmanAE(n_x=n_x, n_z=args.n_z, p=args.p).to(device)
-    print(f"\nModel created: n_x={n_x}, n_z={args.n_z}, p={args.p}")
+    model = KoopmanAE(n_x=n_x, n_z=n_z, p=args.p, use_observables=False).to(device)
+    print(f"\nModel created: n_x={n_x}, n_z={n_z} (10×{n_x}), p={args.p}")
     
     # Train model
     print("\nStarting training...")
@@ -515,7 +520,7 @@ def main():
         hankel_Tseq=8,
         L=4,
         n_x=n_x,
-        n_z=args.n_z,
+        n_z=n_z,
         save_dir=args.save_dir
     )
     
@@ -535,7 +540,7 @@ def main():
             x2 = x2.to(device)
             
             losses = compute_loss_batch(
-                model, x0, x1, x2, all_X_train, device, n_x, args.n_z,
+                model, x0, x1, x2, all_X_train, device, n_x, n_z,
                 64, 8, 4
             )
             test_losses.append(losses['total'].item())
