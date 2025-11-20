@@ -140,11 +140,14 @@ def train_model(model, train_loader, all_X, device, n_epochs=40,
             z_pred2 = z_pred @ model.A_f.T
             loss_ms = mse(z_pred2, z2)
             
-            # eDMD observables regression (learnable A_g)
-            g0 = out0['g']
-            g1 = out1['g']
-            g_pred = g0 @ model.A_g.T
-            loss_edmd = mse(g_pred, g1)
+            # eDMD observables regression (only if observables are enabled)
+            if model.use_observables and out0['g'] is not None:
+                g0 = out0['g']
+                g1 = out1['g']
+                g_pred = g0 @ model.A_g.T
+                loss_edmd = mse(g_pred, g1)
+            else:
+                loss_edmd = torch.tensor(0.0, device=device)
             
             # Bidirectional constraint
             Id = torch.eye(model.A_f.shape[0], device=device)
@@ -194,11 +197,9 @@ def train_model(model, train_loader, all_X, device, n_epochs=40,
             
             # Spectral penalty (approx)
             loss_spec = spectral_radius_penalty(model.A_f, iters=8, target=1.1)
-            
-            # Sparsity on observables net weights
-            sparsity_term = 0.0
-            for name, param in model.obs.named_parameters():
-                sparsity_term += param.norm(1)
+
+            # Sparsity-promoting penalty across encoder/decoder/observables
+            sparsity_term = model.sparsity_loss(mode="l1")
             
             # Total loss
             loss = (lam_rec * loss_rec + lam_lin * loss_lin + lam_ms * loss_ms +
@@ -216,9 +217,11 @@ def train_model(model, train_loader, all_X, device, n_epochs=40,
         log.append(avg_loss)
         
         if ep % 5 == 0:
+            edmd_str = f"edmd {loss_edmd.item():.6f} | " if model.use_observables else ""
             print(f"Epoch {ep:03d} | loss {avg_loss:.6f} | rec {loss_rec.item():.6f} | "
-                  f"lin {loss_lin.item():.6f} | edmd {loss_edmd.item():.6f} | "
-                  f"hankel {loss_hankel.item():.6f} | bi {loss_bi.item():.6f}")
+                  f"lin {loss_lin.item():.6f} | {edmd_str}"
+                  f"hankel {loss_hankel.item():.6f} | bi {loss_bi.item():.6f} | "
+                  f"sparse {sparsity_term.item():.6f}")
     
     return log
 
@@ -293,11 +296,11 @@ def main():
     
     # Create model
     n_x = 2  # Duffing oscillator state dimension
-    n_z = 6  # Latent dimension
-    p = 20   # Observables dimension
+    n_z = 10 * n_x  # Latent dimension: 10 times state dimension
+    p = 20   # Observables dimension (not used when use_observables=False)
     
-    model = KoopmanAE(n_x=n_x, n_z=n_z, p=p).to(device)
-    print(f"\nModel created: n_x={n_x}, n_z={n_z}, p={p}")
+    model = KoopmanAE(n_x=n_x, n_z=n_z, p=p, use_observables=False).to(device)
+    print(f"\nModel created: n_x={n_x}, n_z={n_z} (10×{n_x}), p={p}")
     
     # Train model
     print("\nStarting training...")
@@ -354,4 +357,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
