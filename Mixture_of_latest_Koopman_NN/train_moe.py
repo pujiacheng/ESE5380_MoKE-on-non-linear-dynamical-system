@@ -9,6 +9,7 @@ Features:
 - Spectral radius penalty per expert
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,84 +24,83 @@ from koopman_moe_neural_network import (
 )
 
 
-def prepare_data_from_trajectories(trajs, n_steps=8):
+def prepare_data_from_trajectories(trajs):
     """
-    Convert trajectory data to training sequences (x_t, x_{t+1}, ..., x_{t+n_steps})
+    Convert trajectory data to training tuples for multi-step linearity
     
     Args:
         trajs: array of shape (n_traj, n_timesteps, n_x)
-        n_steps: number of future steps to include
     
     Returns:
-        list of tensors [xt, xt1, ..., xt_n] for consecutive states
+        dict with 'x0', 'x1', and 'x_k' for k in [10, 20, ..., 50]
     """
     n_traj, n_timesteps, n_x = trajs.shape
     
-    all_states = [[] for _ in range(n_steps + 1)]  # xt, xt1, ..., xt8
+    # Horizons for multi-step linearity (up to 50 steps)
+    horizons = [1, 10, 20, 30, 40, 50]
+    max_horizon = max(horizons)
+    
+    # Initialize lists for each horizon
+    data_lists = {h: [] for h in horizons}
+    x0_list = []
     
     for traj in trajs:
-        if n_timesteps >= n_steps + 1:
-            for i in range(n_steps + 1):
-                if i == 0:
-                    # x_t: from start to -(n_steps)
-                    all_states[i].append(traj[:-n_steps])
-                elif i == n_steps:
-                    # x_{t+n_steps}: from n_steps to end
-                    all_states[i].append(traj[n_steps:])
+        if n_timesteps > max_horizon:
+            # x_t: from start to -(max_horizon)
+            x0_list.append(traj[:-max_horizon])
+            
+            # x_{t+k} for each horizon
+            for h in horizons:
+                if h == max_horizon:
+                    data_lists[h].append(traj[h:])
                 else:
-                    # x_{t+i}: from i to -(n_steps-i)
-                    all_states[i].append(traj[i:-(n_steps-i)])
+                    data_lists[h].append(traj[h:-(max_horizon-h)])
     
     # Concatenate and convert to tensors
-    state_tensors = []
-    for states in all_states:
-        concatenated = np.concatenate(states, axis=0)
-        state_tensors.append(torch.tensor(concatenated, dtype=torch.float32))
+    result = {
+        'x0': torch.tensor(np.concatenate(x0_list, axis=0), dtype=torch.float32)
+    }
     
-    return state_tensors
+    for h in horizons:
+        result[f'x{h}'] = torch.tensor(np.concatenate(data_lists[h], axis=0), dtype=torch.float32)
+    
+    return result
 
 
-def compute_loss_moe(model, state_sequence, device):
+def compute_loss_moe(model, data_batch, device):
     """
     Compute loss for MoE Koopman model
     
     Args:
-        state_sequence: list of tensors [x0, x1, ..., x8] for consecutive states
+        model: KoopmanMoE model
+        data_batch: dict with 'x0', 'x1', 'x10', 'x20', ..., 'x50'
         device: device to run on
     
     Includes:
     1. Reconstruction loss (per expert, weighted by gating)
     2. Prediction loss (1-step)
-    3. Multi-step loss (8-step)
-    4. Latent linearity (per expert)
-    5. Load balancing (ensure all experts used)
-    6. Diversity loss (encourage specialization)
-    7. Bidirectional constraint (per expert)
-    8. Spectral radius penalty (per expert)
+    3. Multi-step latent linearity (1, 10, 20, ..., 50 steps)
+    4. Load balancing (ensure all experts used)
+    5. Bidirectional constraint (per expert)
+    6. Spectral radius penalty (per expert)
     """
-    # Hyperparameters (rebalanced for Koopman + MoE)
-    lam_rec = 1.0       # Reconstruction (baseline)
-    lam_pred = 5.0      # 1-step prediction (reduced from 10.0)
-    lam_ms = 10.0       # 8-step multi-step (INCREASED - most important!)
-    lam_lin = 8.0       # Linearity (INCREASED - enforce Koopman structure)
-    lam_balance = 1.0   # Load balancing
-    lam_diversity_latent = 0.5     # Latent diversity (increased)
-    lam_diversity_operator = 0.5   # Operator diversity (increased)
-    lam_bi = 2.0        # Bidirectional (INCREASED - stability)
-    lam_spec = 1.5      # Spectral radius (INCREASED - prevent explosion)
+    # Hyperparameters
+    lam_rec = 2.0       # 1. Reconstruction
+    lam_pred = 15.0     # 2. 1-step prediction (PRIMARY)
+    lam_lin = 12.0      # 3. Multi-step linearity (KOOPMAN CORE)
+    lam_balance = 1.0   # 4. Load balancing (prevent expert collapse)
+    lam_bi = 1.0        # 5. Bidirectional
+    lam_spec = 5.0      # 6. Spectral radius (stability)
     
-    # Unpack states
-    x0 = state_sequence[0]
-    x1 = state_sequence[1]
-    x8 = state_sequence[8]  # 8-step ahead
+    # Extract data
+    x0 = data_batch['x0']
+    x1 = data_batch['x1']
     
     mse = nn.MSELoss()
     
     # Forward pass for current state
     out0 = model(x0)
     weights0 = out0['weights']  # (batch, n_experts)
-    expert_recs = out0['expert_recs']  # List of (batch, n_x)
-    expert_latents = out0['expert_latents']  # List of (batch, n_z)
     x_rec_blended = out0['x_rec']  # (batch, n_x)
     
     # === 1. Reconstruction Loss ===
@@ -119,66 +119,60 @@ def compute_loss_moe(model, state_sequence, device):
     x1_pred_blended = model.blending(expert_preds, weights0)
     loss_pred = mse(x1_pred_blended, x1)
     
-    # === 3. Multi-Step Loss (8-step) ===
-    # Predict 8 steps ahead using iterated predictions
-    loss_ms = 0
-    expert_preds_8step = []
-    for expert in model.experts:
-        x_pred = x0
-        # Iterate 8 times
-        for _ in range(8):
-            x_pred = expert.predict_next(x_pred)
-        expert_preds_8step.append(x_pred)
+    # === 3. Multi-Step Latent Linearity (per expert) ===
+    # z_{t+k} should equal A_f^k @ z_t for k = 1, 10, 20, ..., 50
+    # Weight smaller steps MORE than larger steps (easier to satisfy, more important)
     
-    # Blend 8-step predictions
-    x8_pred_blended = model.blending(expert_preds_8step, weights0)
-    loss_ms = mse(x8_pred_blended, x8)
+    horizons = [1, 10, 20, 30, 40, 50]
+    # Decaying weights: 1.0 → 0.5
+    horizon_weights = {
+        1: 1.0,    # Most important
+        10: 0.8,
+        20: 0.6,
+        30: 0.4,
+        40: 0.3,
+        50: 0.2    # Least important
+    }
     
-    # === 4. Latent Linearity (per expert) ===
-    # z_{t+1} should equal A_f @ z_t
     loss_lin = 0
-    for i, expert in enumerate(model.experts):
-        z0 = expert.encoder(x0)
-        z1_true = expert.encoder(x1)
-        z1_pred = z0 @ expert.A_f.T
-        # Weight by how much this expert was active
-        loss_lin += (weights0[:, i:i+1] * (z1_pred - z1_true)**2).mean()
     
-    # === 5. Load Balancing Loss ===
-    # Ensure all experts are used roughly equally
+    # Pre-compute A^k for each expert (for efficiency)
+    A_powers = {}
+    for i, expert in enumerate(model.experts):
+        A_powers[i] = {1: expert.A_f}
+        A_k = expert.A_f.clone()
+        for k in [10, 20, 30, 40, 50]:
+            # Compute A^k by repeated multiplication from previous power
+            prev_k = horizons[horizons.index(k) - 1]
+            for _ in range(k - prev_k):
+                A_k = A_k @ expert.A_f
+            A_powers[i][k] = A_k.clone()
+    
+    # Compute linearity loss for each horizon
+    for k in horizons:
+        x_k = data_batch[f'x{k}']
+        w_k = horizon_weights[k]
+        
+        for i, expert in enumerate(model.experts):
+            z0 = expert.encoder(x0)
+            zk_true = expert.encoder(x_k)
+            zk_pred = z0 @ A_powers[i][k].T
+            
+            # Weight by gating AND by horizon importance
+            loss_lin += w_k * (weights0[:, i:i+1] * (zk_pred - zk_true)**2).mean()
+    
+    # Normalize by sum of weights
+    total_weight = sum(horizon_weights.values())
+    loss_lin = loss_lin / total_weight
+    
+    # === 4. Load Balancing Loss ===
+    # Ensure all experts are used roughly equally (prevents expert collapse)
     avg_weights = weights0.mean(dim=0)  # Average over batch
     target_weight = 1.0 / model.n_experts
     loss_balance = ((avg_weights - target_weight)**2).sum()
     
-    # === 6. Diversity Loss ===
-    # 6a. Latent diversity (encourage different encodings)
-    loss_diversity_latent = 0
-    for i in range(model.n_experts):
-        for j in range(i+1, model.n_experts):
-            # Cosine similarity (penalize if similar)
-            similarity = F.cosine_similarity(
-                expert_latents[i], 
-                expert_latents[j], 
-                dim=-1
-            ).mean()
-            loss_diversity_latent -= similarity.abs()
-    # Normalize by number of pairs
-    n_pairs = model.n_experts * (model.n_experts - 1) / 2
-    if n_pairs > 0:
-        loss_diversity_latent /= n_pairs
-    
-    # 6b. Operator diversity (encourage different Koopman operators)
-    loss_diversity_operator = 0
-    for i in range(model.n_experts):
-        for j in range(i+1, model.n_experts):
-            # Frobenius inner product
-            A_sim = (model.experts[i].A_f * model.experts[j].A_f).sum()
-            loss_diversity_operator -= A_sim.abs() / (model.n_z ** 2)
-    if n_pairs > 0:
-        loss_diversity_operator /= n_pairs
-    
-    # === 7. Bidirectional Constraint (per expert) ===
-    # A_f @ A_b ≈ I
+    # === 5. Bidirectional Constraint (per expert) ===
+    # A_f @ A_b ≈ I (ensures reversibility)
     loss_bi = 0
     I = torch.eye(model.n_z, device=device)
     for expert in model.experts:
@@ -186,22 +180,19 @@ def compute_loss_moe(model, state_sequence, device):
         loss_bi += (expert.A_b @ expert.A_f - I).norm()**2
     loss_bi /= model.n_experts
     
-    # === 8. Spectral Radius Penalty (per expert) ===
-    # Prevent explosive dynamics
+    # === 6. Spectral Radius Penalty (per expert) ===
+    # Prevent explosive dynamics (keep eigenvalues bounded)
     loss_spec = 0
     for expert in model.experts:
-        loss_spec += spectral_radius_penalty(expert.A_f, iters=8, target=1.1)
+        loss_spec += spectral_radius_penalty(expert.A_f, iters=8, target=0.99)
     loss_spec /= model.n_experts
     
     # === Total Loss ===
     loss_total = (
         lam_rec * loss_rec +
         lam_pred * loss_pred +
-        lam_ms * loss_ms +
         lam_lin * loss_lin +
         lam_balance * loss_balance +
-        lam_diversity_latent * loss_diversity_latent +
-        lam_diversity_operator * loss_diversity_operator +
         lam_bi * loss_bi +
         lam_spec * loss_spec
     )
@@ -210,18 +201,15 @@ def compute_loss_moe(model, state_sequence, device):
         'total': loss_total,
         'rec': loss_rec,
         'pred': loss_pred,
-        'ms': loss_ms,
         'lin': loss_lin,
         'balance': loss_balance,
-        'diversity_latent': loss_diversity_latent,
-        'diversity_operator': loss_diversity_operator,
         'bi': loss_bi,
         'spec': loss_spec
     }
 
 
 def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None, 
-                    early_stopping=False, patience=20):
+                    early_stopping=False, patience=20, checkpoint_path=None):
     """
     Train the MoE Koopman model
     
@@ -233,6 +221,7 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
         val_loader: optional validation DataLoader
         early_stopping: whether to use early stopping
         patience: number of epochs to wait for improvement
+        checkpoint_path: path to save best model checkpoint (optional)
     
     Returns:
         log: list of dicts with loss history
@@ -240,37 +229,92 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     log = []
-    # Multi-criteria early stopping
-    best_val_ms = float('inf')        # Best 8-step prediction
-    best_val_lin = float('inf')       # Best linearity
-    best_combined = float('inf')      # Best combined score
+    # Early stopping based on total validation loss
+    best_val_total = float('inf')     # Best total validation loss
     patience_counter = 0
     best_model_state = None
     
     # Print header
     print("\n" + "="*110)
+    print("🎯 TRAINING WITH MULTI-STEP LINEARITY (1, 10, 20, 30, 40, 50 steps)")
+    print("   Weights: 1.0 (1-step) → 0.2 (50-step) - prioritizing near-term linearity")
+    print("="*110)
     if val_loader is not None:
         if early_stopping:
-            print(f"{'Epoch':<8} {'Train MS(8)':<12} {'Train Lin':<12} "
-                  f"{'Val MS(8)':<12} {'Val Lin':<12} {'Combined':<12} {'Status':<22}")
+            print(f"{'Epoch':<8} {'Train Total':<12} {'Train Pred':<12} "
+                  f"{'Val Total':<12} {'Val Pred':<12} {'Status':<22}")
         else:
-            print(f"{'Epoch':<8} {'Train MS(8)':<12} {'Train Lin':<12} "
-                  f"{'Val MS(8)':<12} {'Val Lin':<12}")
+            print(f"{'Epoch':<8} {'Train Total':<12} {'Train Pred':<12} "
+                  f"{'Val Total':<12} {'Val Pred':<12}")
     else:
-        print(f"{'Epoch':<8} {'Train Loss':<12} {'Train Pred':<12} {'Train MS(8)':<12} {'Balance':<12}")
+        print(f"{'Epoch':<8} {'Train Loss':<12} {'Train Pred':<12} {'Train Lin':<12} {'Balance':<12}")
     print("="*110)
     
     for ep in range(n_epochs):
+        # Debug prints at epoch 0 to understand initial state
+        if ep == 0:
+            model.eval()
+            with torch.no_grad():
+                # Get a sample batch for analysis
+                sample_batch = next(iter(train_loader))
+                x0_sample = sample_batch[0][:32].to(device)  # First 32 samples
+                x50_sample = sample_batch[6][:32].to(device)  # x50
+                
+                print("\n" + "="*80)
+                print("🔍 DEBUG: Epoch 0 Initial State Analysis")
+                print("="*80)
+                
+                # Input data statistics
+                print(f"\n📊 Input Data (x0):")
+                print(f"   Shape: {x0_sample.shape}")
+                print(f"   Mean: {x0_sample.mean().item():.6f}, Std: {x0_sample.std().item():.6f}")
+                print(f"   Min: {x0_sample.min().item():.6f}, Max: {x0_sample.max().item():.6f}")
+                
+                print(f"\n📊 Input Data (x50):")
+                print(f"   Mean: {x50_sample.mean().item():.6f}, Std: {x50_sample.std().item():.6f}")
+                print(f"   |x50 - x0| mean: {(x50_sample - x0_sample).abs().mean().item():.6f}")
+                
+                # Per-expert analysis
+                print(f"\n🧠 Expert Analysis:")
+                for i, expert in enumerate(model.experts):
+                    z0 = expert.encoder(x0_sample)
+                    z50_true = expert.encoder(x50_sample)
+                    
+                    # A^50
+                    A_power = expert.A_f
+                    for _ in range(49):
+                        A_power = A_power @ expert.A_f
+                    z50_pred = z0 @ A_power.T
+                    
+                    # Spectral radius
+                    eigvals = torch.linalg.eigvals(expert.A_f)
+                    spec_radius = eigvals.abs().max().item()
+                    
+                    print(f"\n   Expert {i+1}:")
+                    print(f"     Latent z0:  mean={z0.mean().item():.4f}, std={z0.std().item():.4f}, "
+                          f"min={z0.min().item():.4f}, max={z0.max().item():.4f}")
+                    print(f"     Latent z50_true: mean={z50_true.mean().item():.4f}, std={z50_true.std().item():.4f}")
+                    print(f"     Latent z50_pred: mean={z50_pred.mean().item():.4f}, std={z50_pred.std().item():.4f}")
+                    print(f"     |z50_pred - z50_true|: {(z50_pred - z50_true).abs().mean().item():.6f}")
+                    print(f"     A_f spectral radius: {spec_radius:.4f}")
+                    print(f"     A^50 norm: {A_power.norm().item():.4f}")
+                
+                print("\n" + "="*80 + "\n")
+            model.train()
+        
         # Training
         model.train()
         epoch_losses = []
         
         for batch in train_loader:
-            # batch is a list of 9 tensors: [x0, x1, ..., x8]
-            state_sequence = [state.to(device) for state in batch]
+            # batch is a tuple of tensors: (x0, x1, x10, x20, ..., x50)
+            horizons = [1, 10, 20, 30, 40, 50]
+            data_batch = {'x0': batch[0].to(device)}
+            for idx, h in enumerate(horizons):
+                data_batch[f'x{h}'] = batch[idx + 1].to(device)
             
             # Compute losses
-            losses = compute_loss_moe(model, state_sequence, device)
+            losses = compute_loss_moe(model, data_batch, device)
             
             # Backprop
             optimizer.zero_grad()
@@ -290,8 +334,11 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
             val_losses = []
             with torch.no_grad():
                 for batch in val_loader:
-                    state_sequence = [state.to(device) for state in batch]
-                    losses = compute_loss_moe(model, state_sequence, device)
+                    horizons = [1, 10, 20, 30, 40, 50]
+                    data_batch = {'x0': batch[0].to(device)}
+                    for idx, h in enumerate(horizons):
+                        data_batch[f'x{h}'] = batch[idx + 1].to(device)
+                    losses = compute_loss_moe(model, data_batch, device)
                     val_losses.append({k: v.item() for k, v in losses.items()})
             
             # Average validation losses
@@ -301,46 +348,31 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
             
             avg_losses['val_total'] = avg_val_losses['total']
             avg_losses['val_pred'] = avg_val_losses['pred']
-            avg_losses['val_ms'] = avg_val_losses['ms']
             avg_losses['val_lin'] = avg_val_losses['lin']
             
-            # Multi-criteria early stopping
+            # Early stopping based on total validation loss
             if early_stopping:
-                # Combined score: weighted sum of prediction accuracy + linearity
-                # Both should be minimized
-                weight_ms = 0.7   # 70% weight on prediction accuracy
-                weight_lin = 0.3  # 30% weight on maintaining linearity
-                
-                current_combined = weight_ms * avg_val_losses['ms'] + weight_lin * avg_val_losses['lin']
+                current_val_total = avg_val_losses['total']
                 
                 # Check if this is the best model
-                is_best = False
-                if current_combined < best_combined:
-                    best_combined = current_combined
-                    best_val_ms = avg_val_losses['ms']
-                    best_val_lin = avg_val_losses['lin']
+                if current_val_total < best_val_total:
+                    best_val_total = current_val_total
                     patience_counter = 0
                     best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    is_best = True
-                    status = "✓ Best (MS+Lin)"
+                    status = "✓ Best"
+                    
+                    # Save best checkpoint to disk immediately
+                    if checkpoint_path:
+                        torch.save(model.state_dict(), checkpoint_path)
                 else:
                     patience_counter += 1
-                    # Show what would have been best
-                    if avg_val_losses['ms'] < best_val_ms:
-                        status = f"MS↓ Lin↑ | {patience_counter}/{patience}"
-                    elif avg_val_losses['lin'] < best_val_lin:
-                        status = f"MS↑ Lin↓ | {patience_counter}/{patience}"
-                    else:
-                        status = f"Both↑ | {patience_counter}/{patience}"
+                    status = f"Wait {patience_counter}/{patience}"
                     
                     if patience_counter >= patience:
-                        print(f"{'':8} {'':12} {'':12} {'':12} {'':12} {'':12} {'Early Stop!':<22}")
+                        print(f"{'':8} {'':12} {'':12} {'':12} {'':12} {'Early Stop!':<22}")
                         print("="*110)
                         print(f"Training stopped early at epoch {ep}")
-                        print(f"Best validation:")
-                        print(f"  Combined score: {best_combined:.6f}")
-                        print(f"  8-step loss: {best_val_ms:.6f}")
-                        print(f"  Linearity loss: {best_val_lin:.6f}")
+                        print(f"Best validation total loss: {best_val_total:.6f}")
                         print("="*110)
                         # Restore best model
                         model.load_state_dict(best_model_state)
@@ -352,20 +384,15 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
         # Print progress every epoch
         if val_loader is not None:
             if early_stopping:
-                # Calculate current combined score for display
-                weight_ms = 0.7
-                weight_lin = 0.3
-                current_combined = weight_ms * avg_losses['val_ms'] + weight_lin * avg_losses['val_lin']
-                
-                print(f"{ep:<8} {avg_losses['ms']:<12.6f} {avg_losses['lin']:<12.6f} "
-                      f"{avg_losses['val_ms']:<12.6f} {avg_losses['val_lin']:<12.6f} "
-                      f"{current_combined:<12.6f} {status:<22}")
+                print(f"{ep:<8} {avg_losses['total']:<12.6f} {avg_losses['pred']:<12.6f} "
+                      f"{avg_losses['val_total']:<12.6f} {avg_losses['val_pred']:<12.6f} "
+                      f"{status:<22}")
             else:
-                print(f"{ep:<8} {avg_losses['ms']:<12.6f} {avg_losses['lin']:<12.6f} "
-                      f"{avg_losses['val_ms']:<12.6f} {avg_losses['val_lin']:<12.6f}")
+                print(f"{ep:<8} {avg_losses['total']:<12.6f} {avg_losses['pred']:<12.6f} "
+                      f"{avg_losses['val_total']:<12.6f} {avg_losses['val_pred']:<12.6f}")
         else:
             print(f"{ep:<8} {avg_losses['total']:<12.6f} {avg_losses['pred']:<12.6f} "
-                  f"{avg_losses['ms']:<12.6f} {avg_losses['balance']:<12.6f}")
+                  f"{avg_losses['lin']:<12.6f} {avg_losses['balance']:<12.6f}")
     
     print("="*110 + "\n")
     return log
@@ -400,16 +427,10 @@ def evaluate_model_moe(model, test_traj, device, n_steps=100):
         # Compute errors at training horizons and beyond
         metrics = {}
         
-        # 1-step error (what we trained on)
-        if len(true) > 1:
-            metrics['error_1step'] = np.mean((preds[1] - true[1])**2)
-        
-        # 8-step error (what we trained on)
-        if len(true) > 8:
-            metrics['error_8step'] = np.mean((preds[8] - true[8])**2)
-        
-        # Longer horizons (generalization)
-        for horizon in [20, 50, 100]:
+        # Errors at various horizons
+        # Linearity trained: 1, 10, 20, 30, 40, 50
+        # Extrapolation: 100
+        for horizon in [1, 10, 20, 50, 100]:
             if len(true) > horizon:
                 metrics[f'error_{horizon}step'] = np.mean((preds[horizon] - true[horizon])**2)
         
@@ -491,6 +512,10 @@ def main():
                        help='Early stopping patience (epochs)')
     parser.add_argument('--save_prefix', type=str, default='',
                        help='Prefix for saved files')
+    parser.add_argument('--inference_only', action='store_true',
+                       help='Skip training, load model and generate plots only')
+    parser.add_argument('--model_path', type=str, default='',
+                       help='Path to pre-trained model weights (.pth file)')
     args = parser.parse_args()
     
     # Set random seeds
@@ -532,7 +557,7 @@ def main():
     
     config = system_configs[args.system]
     n_x = config['n_x']
-    n_z = n_x * 10  # Latent dimension = 10× input dimension
+    n_z = n_x * 5  # Latent dimension = 5× input dimension
     system_name = config['name']
     state_labels = config['labels']
     
@@ -558,22 +583,30 @@ def main():
     print(f"Generated 10 test trajectories (unseen data)")
     print(f"State dimension: {n_x}D")
     
-    # Prepare training data
-    print("\nPreparing training data...")
-    state_sequence = prepare_data_from_trajectories(trajs_train, n_steps=8)
-    # state_sequence is a list of 9 tensors: [x0, x1, ..., x8]
+    # Prepare training data with multi-step horizons
+    print("\nPreparing training data with multi-step linearity horizons...")
+    data_dict = prepare_data_from_trajectories(trajs_train)
+    
+    # Horizons used (up to 50 steps)
+    horizons = [1, 10, 20, 30, 40, 50]
+    print(f"  Linearity horizons: {horizons}")
+    print(f"  Horizon weights: 1.0→0.2 (decaying)")
     
     # Split into train/val
-    n_samples = len(state_sequence[0])
+    n_samples = len(data_dict['x0'])
     n_val = int(n_samples * args.val_split)
     n_train = n_samples - n_val
     
-    # Split each tensor
-    train_states = [s[:n_train] for s in state_sequence]
-    val_states = [s[n_train:] for s in state_sequence]
+    # Create tensor lists for DataLoader
+    train_tensors = [data_dict['x0'][:n_train]]
+    val_tensors = [data_dict['x0'][n_train:]]
+    
+    for h in horizons:
+        train_tensors.append(data_dict[f'x{h}'][:n_train])
+        val_tensors.append(data_dict[f'x{h}'][n_train:])
     
     train_loader = DataLoader(
-        TensorDataset(*train_states),
+        TensorDataset(*train_tensors),
         batch_size=args.batch_size,
         shuffle=True
     )
@@ -581,7 +614,7 @@ def main():
     val_loader = None
     if n_val > 0:
         val_loader = DataLoader(
-            TensorDataset(*val_states),
+            TensorDataset(*val_tensors),
             batch_size=args.batch_size,
             shuffle=False
         )
@@ -604,161 +637,267 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total trainable parameters: {n_params:,}")
     
-    # Train model
-    print("\nStarting training...")
-    if args.early_stopping:
-        print(f"Early stopping enabled (patience={args.patience})")
+    # Check for inference-only mode
+    if args.inference_only:
+        # Load pre-trained model
+        if args.model_path:
+            model_path = args.model_path
+        else:
+            model_path = f'{args.save_prefix}{args.system}_moe_model.pth'
+        
+        if not os.path.exists(model_path):
+            print(f"ERROR: Model file not found: {model_path}")
+            print("Please train the model first or provide a valid --model_path")
+            return
+        
+        print(f"\n=== INFERENCE ONLY MODE ===")
+        print(f"Loading model from: {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print("Model loaded successfully!")
+        
+        # Create dummy log (no training curves to show)
+        log = None
+    else:
+        # Train model
+        print("\nStarting training...")
+        if args.early_stopping:
+            print(f"Early stopping enabled (patience={args.patience})")
+        
+        # Define model save path for checkpointing
+        model_file = f'{args.save_prefix}{args.system}_moe_model.pth'
+        
+        log = train_model_moe(
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            n_epochs=args.n_epochs,
+            val_loader=val_loader,
+            early_stopping=args.early_stopping,
+            patience=args.patience,
+            checkpoint_path=model_file
+        )
     
-    log = train_model_moe(
-        model=model,
-        train_loader=train_loader,
-        device=device,
-        n_epochs=args.n_epochs,
-        val_loader=val_loader,
-        early_stopping=args.early_stopping,
-        patience=args.patience
-    )
+    # Evaluate on ALL test trajectories
+    n_test = len(trajs_test)
+    print(f"\nEvaluating model on {n_test} test trajectories...")
     
-    # Evaluate on UNSEEN test trajectory
-    print("\nEvaluating model on test data...")
-    test_traj = trajs_test[0]  # Use first TEST trajectory (completely unseen)
-    true, preds, weights, metrics = evaluate_model_moe(model, test_traj, device, n_steps=100)
+    all_results = []
+    all_metrics = []
+    all_weights = []
     
-    # Print evaluation metrics
-    print("\n=== Test Set Performance ===")
-    print(f"1-step MSE:   {metrics.get('error_1step', 0):.6f}  (trained on this)")
-    print(f"8-step MSE:   {metrics.get('error_8step', 0):.6f}  (trained on this)")
-    print(f"20-step MSE:  {metrics.get('error_20step', 0):.6f}  (generalization)")
-    print(f"50-step MSE:  {metrics.get('error_50step', 0):.6f}  (generalization)")
-    print(f"100-step MSE: {metrics.get('error_100step', 0):.6f} (generalization)")
-    print(f"Overall MSE:  {metrics.get('error_overall', 0):.6f}")
-    print("="*30)
+    for i, test_traj in enumerate(trajs_test):
+        true, preds, weights, metrics = evaluate_model_moe(model, test_traj, device, n_steps=100)
+        all_results.append({'true': true, 'preds': preds})
+        all_metrics.append(metrics)
+        all_weights.append(weights)
     
-    # Compute prediction error at each timestep
-    prediction_errors = np.sqrt(np.sum((preds - true)**2, axis=1))  # Euclidean distance
+    # Compute average metrics across all test trajectories
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+        std_metrics = np.std([m[key] for m in all_metrics])
     
-    # Visualize results
-    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    # Print evaluation metrics (averaged)
+    print(f"\n=== Test Set Performance (averaged over {n_test} trajectories) ===")
+    print(f"1-step MSE:   {avg_metrics.get('error_1step', 0):.6f}  (linearity trained)")
+    print(f"10-step MSE:  {avg_metrics.get('error_10step', 0):.6f}  (linearity trained)")
+    print(f"20-step MSE:  {avg_metrics.get('error_20step', 0):.6f}  (linearity trained)")
+    print(f"50-step MSE:  {avg_metrics.get('error_50step', 0):.6f}  (linearity trained)")
+    print(f"100-step MSE: {avg_metrics.get('error_100step', 0):.6f} (extrapolation)")
+    print(f"Overall MSE:  {avg_metrics.get('error_overall', 0):.6f}")
+    print("="*50)
     
-    # Plot 1: Phase space (system-dependent)
+    # Colors for different trajectories
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, n_test))
+    
+    # Visualize results - dynamic layout based on state dimension
+    # Row 1: All state variables vs time (all trajectories overlaid)
+    # Row 2: Phase space, Loss curves, Expert usage, Error at horizons
+    n_cols = max(n_x, 4)  # At least 4 columns for row 2
+    fig, axes = plt.subplots(2, n_cols, figsize=(5*n_cols, 10))
+    
+    time_axis = np.arange(len(all_results[0]['true'])) * args.dt
+    
+    # Row 1: Time series for ALL state variables (all trajectories)
+    for i in range(n_x):
+        for j, res in enumerate(all_results):
+            true_j = res['true']
+            preds_j = res['preds']
+            alpha = 0.6 if j > 0 else 1.0
+            label_true = 'True' if j == 0 else None
+            label_pred = 'Predicted' if j == 0 else None
+            axes[0, i].plot(time_axis, true_j[:, i], '-', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha, label=label_true)
+            axes[0, i].plot(time_axis, preds_j[:, i], '--', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha, label=label_pred)
+        axes[0, i].set_xlabel('Time', fontsize=12)
+        axes[0, i].set_ylabel(state_labels[i], fontsize=12)
+        axes[0, i].set_title(f'{state_labels[i]} vs Time ({n_test} trajs)', fontsize=14)
+        if i == 0:
+            axes[0, i].legend(['True', 'Pred'], loc='upper right')
+        axes[0, i].grid(True, alpha=0.3)
+    
+    # Hide unused subplots in row 1
+    for i in range(n_x, n_cols):
+        axes[0, i].axis('off')
+    
+    # Row 2, Col 0: Phase space (all trajectories)
+    for j, res in enumerate(all_results):
+        true_j = res['true']
+        preds_j = res['preds']
+        alpha = 0.6 if j > 0 else 1.0
+        if n_x == 2:
+            axes[1, 0].plot(true_j[:, 0], true_j[:, 1], '-', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha)
+            axes[1, 0].plot(preds_j[:, 0], preds_j[:, 1], '--', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha)
+            axes[1, 0].plot(true_j[0, 0], true_j[0, 1], 'o', color=traj_colors[j], markersize=6)
+        elif n_x == 3:
+            axes[1, 0].plot(true_j[:, 0], true_j[:, 2], '-', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha)
+            axes[1, 0].plot(preds_j[:, 0], preds_j[:, 2], '--', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha)
+            axes[1, 0].plot(true_j[0, 0], true_j[0, 2], 'o', color=traj_colors[j], markersize=6)
+        elif n_x == 4:
+            axes[1, 0].plot(true_j[:, 0], true_j[:, 2], '-', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha)
+            axes[1, 0].plot(preds_j[:, 0], preds_j[:, 2], '--', color=traj_colors[j],
+                           linewidth=1.5, alpha=alpha)
+            axes[1, 0].plot(true_j[0, 0], true_j[0, 2], 'o', color=traj_colors[j], markersize=6)
+    
     if n_x == 2:
-        # 2D systems: standard phase plot
-        axes[0, 0].plot(true[:, 0], true[:, 1], '-o', label='True',
-                       markersize=3, alpha=0.7, linewidth=2)
-        axes[0, 0].plot(preds[:, 0], preds[:, 1], '-x', label='MoE Prediction',
-                       markersize=3, alpha=0.7, linewidth=2)
-        axes[0, 0].set_xlabel(state_labels[0], fontsize=12)
-        axes[0, 0].set_ylabel(state_labels[1], fontsize=12)
-        axes[0, 0].set_title(f'{system_name}: Phase Space', fontsize=14)
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-    
+        axes[1, 0].set_xlabel(state_labels[0], fontsize=12)
+        axes[1, 0].set_ylabel(state_labels[1], fontsize=12)
+        axes[1, 0].set_title(f'Phase Space ({n_test} trajs)', fontsize=14)
     elif n_x == 3:
-        # 3D systems: project to 2D (x-y plane)
-        axes[0, 0].plot(true[:, 0], true[:, 1], '-o', label='True',
-                       markersize=3, alpha=0.7, linewidth=2)
-        axes[0, 0].plot(preds[:, 0], preds[:, 1], '-x', label='MoE Prediction',
-                       markersize=3, alpha=0.7, linewidth=2)
-        axes[0, 0].set_xlabel(f'{state_labels[0]}', fontsize=12)
-        axes[0, 0].set_ylabel(f'{state_labels[1]}', fontsize=12)
-        axes[0, 0].set_title(f'{system_name}: {state_labels[0]}-{state_labels[1]} Projection', fontsize=14)
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-    
+        axes[1, 0].set_xlabel(state_labels[0], fontsize=12)
+        axes[1, 0].set_ylabel(state_labels[2], fontsize=12)
+        axes[1, 0].set_title(f'Phase ({state_labels[0]} vs {state_labels[2]}, {n_test} trajs)', fontsize=14)
     elif n_x == 4:
-        # 4D systems: plot first angle vs second angle
-        axes[0, 0].plot(true[:, 0], true[:, 2], '-o', label='True',
-                       markersize=3, alpha=0.7, linewidth=2)
-        axes[0, 0].plot(preds[:, 0], preds[:, 2], '-x', label='MoE Prediction',
-                       markersize=3, alpha=0.7, linewidth=2)
-        axes[0, 0].set_xlabel(state_labels[0], fontsize=12)
-        axes[0, 0].set_ylabel(state_labels[2], fontsize=12)
-        axes[0, 0].set_title(f'{system_name}: Configuration Space', fontsize=14)
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-    
-    # Plot 2: Time series (first state variable)
-    time_axis = np.arange(len(true)) * args.dt
-    axes[0, 1].plot(time_axis, true[:, 0], '-o', label=f'True {state_labels[0]}',
-                   markersize=2, alpha=0.7, linewidth=2)
-    axes[0, 1].plot(time_axis, preds[:, 0], '-x', label=f'Pred {state_labels[0]}',
-                   markersize=2, alpha=0.7, linewidth=2)
-    axes[0, 1].set_xlabel('Time', fontsize=12)
-    axes[0, 1].set_ylabel(state_labels[0], fontsize=12)
-    axes[0, 1].set_title(f'Time Series: {state_labels[0]}', fontsize=14)
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Plot 3: Prediction error over time
-    time_axis_pred = np.arange(len(prediction_errors)) * args.dt
-    axes[0, 2].plot(time_axis_pred, prediction_errors, linewidth=2, color='red')
-    axes[0, 2].axvline(args.dt * 1, color='green', linestyle='--', alpha=0.5, label='1-step (trained)')
-    axes[0, 2].axvline(args.dt * 8, color='blue', linestyle='--', alpha=0.5, label='8-step (trained)')
-    axes[0, 2].set_xlabel('Time', fontsize=12)
-    axes[0, 2].set_ylabel('Prediction Error (Euclidean)', fontsize=12)
-    axes[0, 2].set_title('Error Growth Over Time', fontsize=14)
-    axes[0, 2].legend()
-    axes[0, 2].set_yscale('log')
-    axes[0, 2].grid(True, alpha=0.3)
-    
-    # Plot 4: Loss curves
-    epochs = range(len(log))
-    axes[1, 0].plot(epochs, [l['total'] for l in log], label='Total', linewidth=2)
-    axes[1, 0].plot(epochs, [l['pred'] for l in log], label='1-step Pred', linewidth=2)
-    axes[1, 0].plot(epochs, [l['ms'] for l in log], label='8-step MS', linewidth=2, linestyle='--')
-    axes[1, 0].plot(epochs, [l['balance'] for l in log], label='Load Balance', linewidth=2)
-    axes[1, 0].set_xlabel('Epoch', fontsize=12)
-    axes[1, 0].set_ylabel('Loss', fontsize=12)
-    axes[1, 0].set_title('Training Loss (log scale)', fontsize=14)
-    axes[1, 0].legend()
-    axes[1, 0].set_yscale('log')
+        axes[1, 0].set_xlabel(state_labels[0], fontsize=12)
+        axes[1, 0].set_ylabel(state_labels[2], fontsize=12)
+        axes[1, 0].set_title(f'Config Space ({n_test} trajs)', fontsize=14)
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Plot 5: Average expert usage
-    avg_expert_usage = weights.mean(axis=0)
-    axes[1, 1].bar(range(n_experts), avg_expert_usage)
-    axes[1, 1].axhline(1.0/n_experts, color='r', linestyle='--',
-                      label=f'Equal ({1.0/n_experts:.3f})')
-    axes[1, 1].set_xlabel('Expert ID', fontsize=12)
-    axes[1, 1].set_ylabel('Average Weight', fontsize=12)
-    axes[1, 1].set_title('Average Expert Usage', fontsize=14)
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3, axis='y')
+    # Row 2, Col 1: Loss curves (or message if inference only)
+    if log is not None:
+        epochs = range(len(log))
+        axes[1, 1].plot(epochs, [l['total'] for l in log], label='Total', linewidth=2)
+        axes[1, 1].plot(epochs, [l['pred'] for l in log], label='1-step Pred', linewidth=2)
+        axes[1, 1].plot(epochs, [l['lin'] for l in log], label='Linearity', linewidth=2, linestyle='--')
+        axes[1, 1].set_xlabel('Epoch', fontsize=12)
+        axes[1, 1].set_ylabel('Loss', fontsize=12)
+        axes[1, 1].set_title('Training Loss', fontsize=14)
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+    else:
+        axes[1, 1].text(0.5, 0.5, 'Inference Only\n(No Training Curves)', 
+                       ha='center', va='center', fontsize=14, transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title('Training Loss', fontsize=14)
+        axes[1, 1].axis('off')
     
-    # Plot 6: Error at specific horizons
-    horizons = [1, 8, 20, 50, 100]
-    horizon_errors = [metrics.get(f'error_{h}step', np.nan) for h in horizons]
-    axes[1, 2].bar(range(len(horizons)), horizon_errors, color=['green', 'blue', 'orange', 'orange', 'red'])
-    axes[1, 2].set_xticks(range(len(horizons)))
-    axes[1, 2].set_xticklabels([f'{h}' for h in horizons])
-    axes[1, 2].set_xlabel('Prediction Horizon (steps)', fontsize=12)
-    axes[1, 2].set_ylabel('MSE', fontsize=12)
-    axes[1, 2].set_title('Error at Different Horizons', fontsize=14)
-    axes[1, 2].set_yscale('log')
+    # Row 2, Col 2: Average expert usage (averaged over all trajectories)
+    avg_weights = np.mean([w.mean(axis=0) for w in all_weights], axis=0)
+    axes[1, 2].bar(range(n_experts), avg_weights)
+    axes[1, 2].axhline(1.0/n_experts, color='r', linestyle='--',
+                      label=f'Equal ({1.0/n_experts:.3f})')
+    axes[1, 2].set_xlabel('Expert ID', fontsize=12)
+    axes[1, 2].set_ylabel('Average Weight', fontsize=12)
+    axes[1, 2].set_title(f'Expert Usage ({n_test} trajs avg)', fontsize=14)
+    axes[1, 2].legend()
     axes[1, 2].grid(True, alpha=0.3, axis='y')
+    
+    # Row 2, Col 3: Error at specific horizons (averaged)
+    eval_horizons = [1, 10, 20, 50, 100]
+    horizon_errors = [avg_metrics.get(f'error_{h}step', np.nan) for h in eval_horizons]
+    colors = ['green' if h <= 50 else 'red' for h in eval_horizons]
+    axes[1, 3].bar(range(len(eval_horizons)), horizon_errors, color=colors)
+    axes[1, 3].set_xticks(range(len(eval_horizons)))
+    axes[1, 3].set_xticklabels([f'{h}' for h in eval_horizons])
+    axes[1, 3].set_xlabel('Horizon (steps)', fontsize=12)
+    axes[1, 3].set_ylabel('MSE (avg)', fontsize=12)
+    axes[1, 3].set_title(f'Error by Horizon ({n_test} trajs avg)', fontsize=14)
+    axes[1, 3].set_yscale('log')
+    axes[1, 3].grid(True, alpha=0.3, axis='y')
+    
+    # Hide unused subplots in row 2
+    for i in range(4, n_cols):
+        axes[1, i].axis('off')
     
     plt.tight_layout()
     results_file = f'{args.save_prefix}{args.system}_moe_results.png'
     plt.savefig(results_file, dpi=150, bbox_inches='tight')
     print(f"Results saved to '{results_file}'")
-    plt.close()  # Close figure to free memory
+    plt.close()
     
-    # Visualize expert usage over time
+    # === NEW: Individual trajectory plots in a grid ===
+    # Plot each of the 10 trajectories in separate subplots
+    n_rows_grid = 2
+    n_cols_grid = 5
+    
+    # For each state variable, create a separate grid figure
+    for state_idx in range(n_x):
+        fig_grid, axes_grid = plt.subplots(n_rows_grid, n_cols_grid, figsize=(20, 8))
+        axes_grid = axes_grid.flatten()
+        
+        for traj_idx, res in enumerate(all_results):
+            if traj_idx >= n_rows_grid * n_cols_grid:
+                break
+            
+            ax = axes_grid[traj_idx]
+            true_traj = res['true']
+            pred_traj = res['preds']
+            
+            ax.plot(time_axis, true_traj[:, state_idx], '-', color='blue', 
+                   linewidth=1.5, label='True')
+            ax.plot(time_axis, pred_traj[:, state_idx], '--', color='red', 
+                   linewidth=1.5, label='Pred')
+            
+            # Calculate MSE for this trajectory
+            traj_mse = np.mean((pred_traj[:, state_idx] - true_traj[:, state_idx])**2)
+            
+            ax.set_title(f'IC {traj_idx+1} (MSE: {traj_mse:.4f})', fontsize=11)
+            ax.set_xlabel('Time', fontsize=9)
+            ax.set_ylabel(state_labels[state_idx], fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=8)
+            
+            if traj_idx == 0:
+                ax.legend(fontsize=8)
+        
+        # Hide unused subplots
+        for idx in range(len(all_results), n_rows_grid * n_cols_grid):
+            axes_grid[idx].axis('off')
+        
+        fig_grid.suptitle(f'{system_name}: {state_labels[state_idx]} - {n_test} Initial Conditions', 
+                         fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        grid_file = f'{args.save_prefix}{args.system}_{state_labels[state_idx]}_grid.png'
+        plt.savefig(grid_file, dpi=150, bbox_inches='tight')
+        print(f"Grid plot saved to '{grid_file}'")
+        plt.close()
+    
+    # Visualize expert usage over time (use first trajectory)
     expert_usage_file = f'{args.save_prefix}{args.system}_expert_usage.png'
-    visualize_expert_usage(weights, save_path=expert_usage_file)
+    visualize_expert_usage(all_weights[0], save_path=expert_usage_file)
     
-    # Save model
-    model_file = f'{args.save_prefix}{args.system}_moe_model.pth'
-    torch.save(model.state_dict(), model_file)
-    print(f"Model saved to '{model_file}'")
+    # Save final model (only if we trained)
+    if not args.inference_only:
+        model_file = f'{args.save_prefix}{args.system}_moe_model.pth'
+        torch.save(model.state_dict(), model_file)
+        print(f"Final model saved to '{model_file}'")
+        print(f"  (Best checkpoint was saved during training whenever validation improved)")
     
-    # Print expert usage statistics
-    print("\n=== Expert Usage Statistics ===")
+    # Print expert usage statistics (averaged over all trajectories)
+    print(f"\n=== Expert Usage Statistics ({n_test} trajs) ===")
+    # Concatenate all weights
+    all_weights_concat = np.concatenate(all_weights, axis=0)
     for i in range(n_experts):
-        avg_weight = weights[:, i].mean()
-        max_weight = weights[:, i].max()
-        min_weight = weights[:, i].min()
-        std_weight = weights[:, i].std()
+        avg_weight = all_weights_concat[:, i].mean()
+        max_weight = all_weights_concat[:, i].max()
+        min_weight = all_weights_concat[:, i].min()
+        std_weight = all_weights_concat[:, i].std()
         print(f"Expert {i+1}: avg={avg_weight:.3f}, max={max_weight:.3f}, "
               f"min={min_weight:.3f}, std={std_weight:.3f}")
 
