@@ -1,0 +1,13 @@
+{
+  "n_z": 9,
+  "lambda_lin": 1.2912732847714334,
+  "lambda_spec": 0.01,
+  "lambda_hankel": 0.6886984048748954,
+  "L": 2,
+  "hankel_Tseq": 6,
+  "spectral_target": 1.15,
+  "spectral_iters": 12,
+  "val_loss": 0.35264985238091423,
+  "test_rmse": 2.361858606338501,
+  "spectral_radius": 1.0044628475900643
+}
