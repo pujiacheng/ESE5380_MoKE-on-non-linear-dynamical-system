@@ -3,41 +3,49 @@ Training script for Mixture of Experts Koopman Autoencoder
 
 Features:
 - Load balancing loss (ensure all experts are used)
-- Diversity loss (encourage expert specialization)
 - Per-expert reconstruction, linearity, and multi-step losses
 - Bidirectional constraint per expert
 - Spectral radius penalty per expert
+- Hankel-based linearity constraint (HAVOK)
+- Sparsity regularization on encoder/decoder weights
 """
 
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
 from koopman_moe_neural_network import (
     KoopmanMoE,
     spectral_radius_penalty,
-    hankel_stack_batch,
-    compute_hankel_svd
+    compute_hankel_linearity_loss
+)
+from evaluation import (
+    one_step_mse,
+    multi_step_nrmse,
+    chamfer_distance_phase,
+    spectral_radius,
+    long_horizon_divergence_rate,
+    reconstruction_error
 )
 
 
-def prepare_data_from_trajectories(trajs):
+def prepare_data_from_trajectories(trajs, hankel_seq_len=16):
     """
     Convert trajectory data to training tuples for multi-step linearity
     
     Args:
         trajs: array of shape (n_traj, n_timesteps, n_x)
+        hankel_seq_len: sequence length for Hankel loss computation
     
     Returns:
-        dict with 'x0', 'x1', and 'x_k' for k in [10, 20, ..., 50]
+        dict with 'x0', 'x1', 'x_k' for k in [10, 20, ..., 50], and 'sequences' for Hankel
     """
     n_traj, n_timesteps, n_x = trajs.shape
     
     # Horizons for multi-step linearity (up to 50 steps)
-    horizons = [1, 10, 20, 30, 40, 50]
+    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     max_horizon = max(horizons)
     
     # Initialize lists for each horizon
@@ -64,10 +72,40 @@ def prepare_data_from_trajectories(trajs):
     for h in horizons:
         result[f'x{h}'] = torch.tensor(np.concatenate(data_lists[h], axis=0), dtype=torch.float32)
     
+    # Also prepare sequence data for Hankel loss
+    # Extract contiguous sequences of length hankel_seq_len from each trajectory
+    sequences = []
+    for traj in trajs:
+        if n_timesteps >= hankel_seq_len:
+            n_seqs = n_timesteps - hankel_seq_len + 1
+            for start in range(0, n_seqs, hankel_seq_len // 2):  # 50% overlap
+                seq = traj[start:start + hankel_seq_len]
+                if len(seq) == hankel_seq_len:
+                    sequences.append(seq)
+    
+    if sequences:
+        result['sequences'] = torch.tensor(np.stack(sequences, axis=0), dtype=torch.float32)
+    
     return result
 
 
-def compute_loss_moe(model, data_batch, device):
+def sample_sequence_batch(sequences, batch_size):
+    """
+    Sample a batch of sequences for Hankel loss computation
+    
+    Args:
+        sequences: tensor of shape (N, T, n_x)
+        batch_size: number of sequences to sample
+    
+    Returns:
+        batch of sequences (batch_size, T, n_x)
+    """
+    n_seqs = sequences.shape[0]
+    indices = np.random.choice(n_seqs, size=min(batch_size, n_seqs), replace=False)
+    return sequences[indices]
+
+
+def compute_loss_moe(model, data_batch, device, sequences=None):
     """
     Compute loss for MoE Koopman model
     
@@ -75,6 +113,7 @@ def compute_loss_moe(model, data_batch, device):
         model: KoopmanMoE model
         data_batch: dict with 'x0', 'x1', 'x10', 'x20', ..., 'x50'
         device: device to run on
+        sequences: optional tensor (batch, T, n_x) for Hankel loss
     
     Includes:
     1. Reconstruction loss (per expert, weighted by gating)
@@ -83,6 +122,8 @@ def compute_loss_moe(model, data_batch, device):
     4. Load balancing (ensure all experts used)
     5. Bidirectional constraint (per expert)
     6. Spectral radius penalty (per expert)
+    7. Hankel-based linearity (HAVOK constraint)
+    8. Sparsity regularization (on encoder/decoder weights)
     """
     # Hyperparameters
     lam_rec = 2.0       # 1. Reconstruction
@@ -91,6 +132,8 @@ def compute_loss_moe(model, data_batch, device):
     lam_balance = 1.0   # 4. Load balancing (prevent expert collapse)
     lam_bi = 1.0        # 5. Bidirectional
     lam_spec = 5.0      # 6. Spectral radius (stability)
+    lam_hankel = 1.0    # 7. Hankel linearity (HAVOK)
+    lam_sparse = 1e-4   # 8. Sparsity (regularization)
     
     # Extract data
     x0 = data_batch['x0']
@@ -123,15 +166,15 @@ def compute_loss_moe(model, data_batch, device):
     # z_{t+k} should equal A_f^k @ z_t for k = 1, 10, 20, ..., 50
     # Weight smaller steps MORE than larger steps (easier to satisfy, more important)
     
-    horizons = [1, 10, 20, 30, 40, 50]
-    # Decaying weights: 1.0 → 0.5
+    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    # Uniform weights: all horizons equally important
     horizon_weights = {
-        1: 1.0,    # Most important
-        10: 0.8,
-        20: 0.6,
-        30: 0.4,
-        40: 0.3,
-        50: 0.2    # Least important
+        1: 1.0,
+        10: 1.0,
+        20: 1.0,
+        30: 1.0,
+        40: 1.0,
+        50: 1.0
     }
     
     loss_lin = 0
@@ -184,8 +227,18 @@ def compute_loss_moe(model, data_batch, device):
     # Prevent explosive dynamics (keep eigenvalues bounded)
     loss_spec = 0
     for expert in model.experts:
-        loss_spec += spectral_radius_penalty(expert.A_f, iters=8, target=0.99)
+        loss_spec += spectral_radius_penalty(expert.A_f, iters=8, target=1.005, lower=0.995)
     loss_spec /= model.n_experts
+    
+    # === 7. Hankel-Based Linearity Loss (per expert) ===
+    # Uses HAVOK: delay embedding should have linear dynamics
+    loss_hankel = torch.tensor(0.0, device=device)
+    if sequences is not None and len(sequences) > 0:
+        loss_hankel = model.hankel_linearity_loss(sequences, L=4, r=8, device=device)
+    
+    # === 8. Sparsity Regularization ===
+    # L1 penalty on encoder/decoder weights across all experts
+    loss_sparse = model.sparsity_loss(mode="l1")
     
     # === Total Loss ===
     loss_total = (
@@ -194,7 +247,9 @@ def compute_loss_moe(model, data_batch, device):
         lam_lin * loss_lin +
         lam_balance * loss_balance +
         lam_bi * loss_bi +
-        lam_spec * loss_spec
+        lam_spec * loss_spec +
+        lam_hankel * loss_hankel +
+        lam_sparse * loss_sparse
     )
     
     return {
@@ -204,24 +259,30 @@ def compute_loss_moe(model, data_batch, device):
         'lin': loss_lin,
         'balance': loss_balance,
         'bi': loss_bi,
-        'spec': loss_spec
+        'spec': loss_spec,
+        'hankel': loss_hankel,
+        'sparse': loss_sparse
     }
 
 
 def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None, 
-                    early_stopping=False, patience=20, checkpoint_path=None):
+                    early_stopping=False, patience=20, checkpoint_path=None,
+                    train_sequences=None, val_sequences=None, hankel_batch_size=32):
     """
     Train the MoE Koopman model
     
     Args:
         model: KoopmanMoE instance
-        train_loader: DataLoader with state sequences [x0, x1, ..., x8]
+        train_loader: DataLoader with state sequences [x0, x1, ..., x50]
         device: device to train on
         n_epochs: number of training epochs
         val_loader: optional validation DataLoader
         early_stopping: whether to use early stopping
         patience: number of epochs to wait for improvement
         checkpoint_path: path to save best model checkpoint (optional)
+        train_sequences: tensor of shape (N, T, n_x) for Hankel loss during training
+        val_sequences: tensor of shape (N, T, n_x) for Hankel loss during validation
+        hankel_batch_size: batch size for Hankel sequence sampling
     
     Returns:
         log: list of dicts with loss history
@@ -237,7 +298,7 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
     # Print header
     print("\n" + "="*110)
     print("🎯 TRAINING WITH MULTI-STEP LINEARITY (1, 10, 20, 30, 40, 50 steps)")
-    print("   Weights: 1.0 (1-step) → 0.2 (50-step) - prioritizing near-term linearity")
+    print("   Weights: uniform (all 1.0) - equal importance for all horizons")
     print("="*110)
     if val_loader is not None:
         if early_stopping:
@@ -308,13 +369,18 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
         
         for batch in train_loader:
             # batch is a tuple of tensors: (x0, x1, x10, x20, ..., x50)
-            horizons = [1, 10, 20, 30, 40, 50]
+            horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
             data_batch = {'x0': batch[0].to(device)}
             for idx, h in enumerate(horizons):
                 data_batch[f'x{h}'] = batch[idx + 1].to(device)
             
+            # Sample sequences for Hankel loss (if available)
+            seq_batch = None
+            if train_sequences is not None and len(train_sequences) > 0:
+                seq_batch = sample_sequence_batch(train_sequences, hankel_batch_size).to(device)
+            
             # Compute losses
-            losses = compute_loss_moe(model, data_batch, device)
+            losses = compute_loss_moe(model, data_batch, device, sequences=seq_batch)
             
             # Backprop
             optimizer.zero_grad()
@@ -334,11 +400,17 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
             val_losses = []
             with torch.no_grad():
                 for batch in val_loader:
-                    horizons = [1, 10, 20, 30, 40, 50]
+                    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
                     data_batch = {'x0': batch[0].to(device)}
                     for idx, h in enumerate(horizons):
                         data_batch[f'x{h}'] = batch[idx + 1].to(device)
-                    losses = compute_loss_moe(model, data_batch, device)
+                    
+                    # Sample sequences for Hankel loss (if available)
+                    seq_batch = None
+                    if val_sequences is not None and len(val_sequences) > 0:
+                        seq_batch = sample_sequence_batch(val_sequences, hankel_batch_size).to(device)
+                    
+                    losses = compute_loss_moe(model, data_batch, device, sequences=seq_batch)
                     val_losses.append({k: v.item() for k, v in losses.items()})
             
             # Average validation losses
@@ -400,7 +472,7 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
 
 def evaluate_model_moe(model, test_traj, device, n_steps=100):
     """
-    Evaluate MoE model by predicting forward in time
+    Evaluate MoE model by predicting forward in time using metrics from evaluation.py
     
     Args:
         model: trained KoopmanMoE model
@@ -412,32 +484,80 @@ def evaluate_model_moe(model, test_traj, device, n_steps=100):
         true: true trajectory
         preds: predicted trajectory
         weights: expert weights over time
-        metrics: dict with errors at different horizons
+        x_rec: reconstructed initial condition
+        metrics: dict with all evaluation metrics
     """
     model.eval()
     
     with torch.no_grad():
         x0 = torch.tensor(test_traj[0], dtype=torch.float32).unsqueeze(0).to(device)
+        
+        # Get reconstruction of initial condition
+        x_rec, _ = model(x0)
+        x_rec = x_rec.cpu().numpy()
+        
+        # Get predictions
         preds, weights = model.predict(x0, n_steps=n_steps)
         
         preds = preds.squeeze(1).cpu().numpy()  # Remove batch dim
         weights = weights.squeeze(1).cpu().numpy()  # Remove batch dim
         true = test_traj[:n_steps+1]
-        
-        # Compute errors at training horizons and beyond
-        metrics = {}
-        
-        # Errors at various horizons
-        # Linearity trained: 1, 10, 20, 30, 40, 50
-        # Extrapolation: 100
-        for horizon in [1, 10, 20, 50, 100]:
-            if len(true) > horizon:
-                metrics[f'error_{horizon}step'] = np.mean((preds[horizon] - true[horizon])**2)
-        
-        # Overall MSE across all steps
-        metrics['error_overall'] = np.mean((preds - true)**2)
     
-    return true, preds, weights, metrics
+    return true, preds, weights, x_rec
+
+
+def compute_all_metrics_moe(model, true, preds, x_rec, device):
+    """
+    Compute all evaluation metrics from evaluation.py for MoE model
+    
+    Args:
+        model: trained KoopmanMoE model
+        true: true trajectory (n_steps+1, n_x)
+        preds: predicted trajectory (n_steps+1, n_x)
+        x_rec: reconstructed initial condition (1, n_x)
+        device: device
+    
+    Returns:
+        dict of all metrics
+    """
+    metrics = {}
+    
+    # Reshape for evaluation functions: (1, n_steps+1, n_x)
+    true_3d = true[np.newaxis, :, :]
+    preds_3d = preds[np.newaxis, :, :]
+    
+    # 1-step MSE
+    metrics['one_step_mse'] = one_step_mse(true_3d[:, :2, :], preds_3d[:, :2, :])
+    
+    # Multi-step NRMSE at various horizons
+    n_steps = true.shape[0] - 1
+    horizons = [h for h in [1, 10, 20, 50, 100] if h < n_steps]
+    nrmse_dict = multi_step_nrmse(true_3d, preds_3d, horizons)
+    for h, val in nrmse_dict.items():
+        metrics[f'nrmse_{h}step'] = val
+    
+    # Chamfer distance in phase space (use first 2 dims)
+    n_x = true.shape[1]
+    dims = (0, 1) if n_x >= 2 else (0,)
+    if len(dims) == 2:
+        metrics['chamfer_distance'] = chamfer_distance_phase(true_3d, preds_3d, dims=dims)
+    
+    # Spectral radius of each expert's Koopman operator (report max)
+    max_rho = 0.0
+    for expert in model.experts:
+        K = expert.A_f.detach().cpu().numpy()
+        rho, _ = spectral_radius(K)
+        max_rho = max(max_rho, rho)
+    metrics['spectral_radius_max'] = max_rho
+    
+    # Long-horizon divergence rate
+    slope, _ = long_horizon_divergence_rate(true_3d, preds_3d)
+    metrics['divergence_rate'] = slope
+    
+    # Reconstruction error (initial condition)
+    metrics['reconstruction_error'] = reconstruction_error(true[0:1], x_rec)
+    
+    return metrics
 
 
 def visualize_expert_usage(weights, save_path='expert_usage.png'):
@@ -583,14 +703,19 @@ def main():
     print(f"Generated 10 test trajectories (unseen data)")
     print(f"State dimension: {n_x}D")
     
-    # Prepare training data with multi-step horizons
+    # Prepare training data with multi-step horizons and Hankel sequences
     print("\nPreparing training data with multi-step linearity horizons...")
-    data_dict = prepare_data_from_trajectories(trajs_train)
+    data_dict = prepare_data_from_trajectories(trajs_train, hankel_seq_len=16)
     
     # Horizons used (up to 50 steps)
-    horizons = [1, 10, 20, 30, 40, 50]
+    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     print(f"  Linearity horizons: {horizons}")
-    print(f"  Horizon weights: 1.0→0.2 (decaying)")
+    print(f"  Horizon weights: uniform (all 1.0)")
+    
+    # Hankel sequences for HAVOK constraint
+    train_sequences = data_dict.get('sequences', None)
+    if train_sequences is not None:
+        print(f"  Hankel sequences: {train_sequences.shape[0]} sequences of length {train_sequences.shape[1]}")
     
     # Split into train/val
     n_samples = len(data_dict['x0'])
@@ -674,7 +799,10 @@ def main():
             val_loader=val_loader,
             early_stopping=args.early_stopping,
             patience=args.patience,
-            checkpoint_path=model_file
+            checkpoint_path=model_file,
+            train_sequences=train_sequences,
+            val_sequences=train_sequences,  # Use same sequences for val (or could split)
+            hankel_batch_size=32
         )
     
     # Evaluate on ALL test trajectories
@@ -684,28 +812,41 @@ def main():
     all_results = []
     all_metrics = []
     all_weights = []
+    all_x_rec = []
     
     for i, test_traj in enumerate(trajs_test):
-        true, preds, weights, metrics = evaluate_model_moe(model, test_traj, device, n_steps=100)
+        true, preds, weights, x_rec = evaluate_model_moe(model, test_traj, device, n_steps=100)
         all_results.append({'true': true, 'preds': preds})
-        all_metrics.append(metrics)
+        all_x_rec.append(x_rec)
         all_weights.append(weights)
+        
+        # Compute metrics for this trajectory
+        metrics = compute_all_metrics_moe(model, true, preds, x_rec, device)
+        all_metrics.append(metrics)
     
     # Compute average metrics across all test trajectories
     avg_metrics = {}
+    std_metrics = {}
     for key in all_metrics[0].keys():
         avg_metrics[key] = np.mean([m[key] for m in all_metrics])
-        std_metrics = np.std([m[key] for m in all_metrics])
+        std_metrics[key] = np.std([m[key] for m in all_metrics])
     
-    # Print evaluation metrics (averaged)
-    print(f"\n=== Test Set Performance (averaged over {n_test} trajectories) ===")
-    print(f"1-step MSE:   {avg_metrics.get('error_1step', 0):.6f}  (linearity trained)")
-    print(f"10-step MSE:  {avg_metrics.get('error_10step', 0):.6f}  (linearity trained)")
-    print(f"20-step MSE:  {avg_metrics.get('error_20step', 0):.6f}  (linearity trained)")
-    print(f"50-step MSE:  {avg_metrics.get('error_50step', 0):.6f}  (linearity trained)")
-    print(f"100-step MSE: {avg_metrics.get('error_100step', 0):.6f} (extrapolation)")
-    print(f"Overall MSE:  {avg_metrics.get('error_overall', 0):.6f}")
-    print("="*50)
+    # Print evaluation metrics (from evaluation.py)
+    print("\n" + "="*70)
+    print(f"EVALUATION METRICS (from evaluation.py, averaged over {n_test} trajectories)")
+    print("="*70)
+    print(f"  1-step MSE:           {avg_metrics['one_step_mse']:.6f} ± {std_metrics['one_step_mse']:.6f}")
+    print(f"  Reconstruction Error: {avg_metrics['reconstruction_error']:.6f} ± {std_metrics['reconstruction_error']:.6f}")
+    print(f"  Spectral Radius (max):{avg_metrics['spectral_radius_max']:.4f}")
+    print(f"  Divergence Rate:      {avg_metrics['divergence_rate']:.6f} ± {std_metrics['divergence_rate']:.6f}")
+    if 'chamfer_distance' in avg_metrics:
+        print(f"  Chamfer Distance:     {avg_metrics['chamfer_distance']:.6f} ± {std_metrics['chamfer_distance']:.6f}")
+    print("\n  Multi-step NRMSE:")
+    for key in sorted(avg_metrics.keys()):
+        if key.startswith('nrmse_'):
+            horizon = key.replace('nrmse_', '').replace('step', '')
+            print(f"    Horizon {horizon:>3}: {avg_metrics[key]:.6f} ± {std_metrics[key]:.6f}")
+    print("="*70)
     
     # Colors for different trajectories
     traj_colors = plt.cm.tab10(np.linspace(0, 1, n_test))
@@ -807,17 +948,16 @@ def main():
     axes[1, 2].legend()
     axes[1, 2].grid(True, alpha=0.3, axis='y')
     
-    # Row 2, Col 3: Error at specific horizons (averaged)
+    # Row 2, Col 3: NRMSE at specific horizons (averaged)
     eval_horizons = [1, 10, 20, 50, 100]
-    horizon_errors = [avg_metrics.get(f'error_{h}step', np.nan) for h in eval_horizons]
+    horizon_nrmse = [avg_metrics.get(f'nrmse_{h}step', np.nan) for h in eval_horizons]
     colors = ['green' if h <= 50 else 'red' for h in eval_horizons]
-    axes[1, 3].bar(range(len(eval_horizons)), horizon_errors, color=colors)
+    axes[1, 3].bar(range(len(eval_horizons)), horizon_nrmse, color=colors)
     axes[1, 3].set_xticks(range(len(eval_horizons)))
     axes[1, 3].set_xticklabels([f'{h}' for h in eval_horizons])
     axes[1, 3].set_xlabel('Horizon (steps)', fontsize=12)
-    axes[1, 3].set_ylabel('MSE (avg)', fontsize=12)
-    axes[1, 3].set_title(f'Error by Horizon ({n_test} trajs avg)', fontsize=14)
-    axes[1, 3].set_yscale('log')
+    axes[1, 3].set_ylabel('NRMSE (avg)', fontsize=12)
+    axes[1, 3].set_title(f'NRMSE by Horizon ({n_test} trajs avg)', fontsize=14)
     axes[1, 3].grid(True, alpha=0.3, axis='y')
     
     # Hide unused subplots in row 2

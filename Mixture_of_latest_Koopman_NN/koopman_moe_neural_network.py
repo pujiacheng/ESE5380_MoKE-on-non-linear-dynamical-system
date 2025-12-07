@@ -2,13 +2,14 @@
 Mixture of Experts (MoE) Koopman Neural Network
 
 Architecture:
-- 8 fully separate experts (each with Encoder + Koopman + Decoder)
+- N KoopmanAE experts (each with Encoder + Koopman A_f/A_b + Decoder + BatchNorm)
 - Input-based soft gating (recomputed at each step)
 - Neural network blending function (learned combination in output space)
-- No ObservablesNet (removed for simplicity)
+- Hankel-based linearity constraint (inherited from base KoopmanAE)
+- Sparsity regularization (inherited from base KoopmanAE)
 
-Each expert learns its own coordinate system and dynamics.
-Experts specialize through load balancing and diversity losses.
+Each expert is a full KoopmanAE that learns its own coordinate system and dynamics.
+Experts specialize through load balancing loss.
 """
 
 import torch
@@ -16,39 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-
-class MLPEncoder(nn.Module):
-    """Encoder network: maps state x to latent representation z"""
-    def __init__(self, n_in=2, n_latent=6, expert_id=0):
-        super().__init__()
-        self.expert_id = expert_id
-        self.net = nn.Sequential(
-            nn.Linear(n_in, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_latent)
-        )
-    
-    def forward(self, x):
-        return self.net(x)
-
-
-class MLPDecoder(nn.Module):
-    """Decoder network: maps latent representation z back to state x"""
-    def __init__(self, n_latent=6, n_out=2, expert_id=0):
-        super().__init__()
-        self.expert_id = expert_id
-        self.net = nn.Sequential(
-            nn.Linear(n_latent, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_out)
-        )
-    
-    def forward(self, z):
-        return self.net(z)
+# Import base KoopmanAE as building block
+from koopman_mixture_neural_network import (
+    KoopmanAE,
+    spectral_radius_penalty,
+    hankel_stack_batch,
+    compute_hankel_svd,
+    compute_hankel_linearity_loss
+)
 
 
 class GatingNetwork(nn.Module):
@@ -59,6 +35,7 @@ class GatingNetwork(nn.Module):
         n_in: dimension of input state
         n_experts: number of experts
         gating_type: 'soft' (default), 'hard', or 'topk'
+        k: number of experts for top-k gating
     """
     def __init__(self, n_in=2, n_experts=8, gating_type='soft', k=2):
         super().__init__()
@@ -68,14 +45,18 @@ class GatingNetwork(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(n_in, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Linear(32, n_experts)
         )
     
     def forward(self, x):
         """
+        Compute gating weights for each expert
+        
         Args:
             x: input state (batch_size, n_in)
         
@@ -125,14 +106,18 @@ class NeuralBlendingNetwork(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Linear(32, n_x)  # Output final state
         )
     
     def forward(self, expert_predictions, gating_weights):
         """
+        Blend expert predictions using learned non-linear combination
+        
         Args:
             expert_predictions: list of tensors, each (batch, n_x)
             gating_weights: tensor (batch, n_experts)
@@ -154,75 +139,24 @@ class NeuralBlendingNetwork(nn.Module):
         return blended
 
 
-class CompleteExpert(nn.Module):
-    """
-    Single complete expert: Encoder + Koopman Operator + Decoder
-    
-    Each expert learns its own coordinate system and linear dynamics
-    """
-    def __init__(self, n_x=2, n_z=6, expert_id=0):
-        super().__init__()
-        self.expert_id = expert_id
-        self.n_z = n_z
-        
-        # Encoder: x → z
-        self.encoder = MLPEncoder(n_in=n_x, n_latent=n_z, expert_id=expert_id)
-        
-        # Decoder: z → x
-        self.decoder = MLPDecoder(n_latent=n_z, n_out=n_x, expert_id=expert_id)
-        
-        # Forward Koopman operator: z_t+1 = A_f @ z_t
-        self.A_f = nn.Parameter(torch.eye(n_z) + 0.01*torch.randn(n_z, n_z))
-        
-        # Backward Koopman operator (for bidirectional constraint)
-        self.A_b = nn.Parameter(torch.eye(n_z) + 0.01*torch.randn(n_z, n_z))
-    
-    def forward(self, x):
-        """
-        Encode and reconstruct
-        
-        Args:
-            x: input state (batch, n_x)
-        
-        Returns:
-            dict with 'z' and 'x_rec'
-        """
-        z = self.encoder(x)
-        x_rec = self.decoder(z)
-        return {'z': z, 'x_rec': x_rec}
-    
-    def predict_next(self, x):
-        """
-        Full prediction: x → z → A@z → x_next
-        
-        Args:
-            x: current state (batch, n_x)
-        
-        Returns:
-            x_next: predicted next state (batch, n_x)
-        """
-        z = self.encoder(x)
-        z_next = z @ self.A_f.T
-        x_next = self.decoder(z_next)
-        return x_next
-
-
 class KoopmanMoE(nn.Module):
     """
     Mixture of Experts Koopman Autoencoder
     
     Architecture:
-    - 8 fully separate experts
+    - N KoopmanAE experts (full encoder + Koopman + decoder with BatchNorm)
     - Input-based gating (recomputed dynamically)
     - Neural network blending in output space
-    - No ObservablesNet
+    - Hankel-based linearity constraint
+    - Sparsity regularization
     
     Args:
         n_x: dimension of state space
         n_z: dimension of latent space (same for all experts)
         n_experts: number of experts
+        hidden: hidden layer size for encoder/decoder
     """
-    def __init__(self, n_x=2, n_z=6, n_experts=8):
+    def __init__(self, n_x=2, n_z=6, n_experts=8, hidden=128):
         super().__init__()
         self.n_x = n_x
         self.n_z = n_z
@@ -231,9 +165,9 @@ class KoopmanMoE(nn.Module):
         # Gating network: x → weights
         self.gating = GatingNetwork(n_in=n_x, n_experts=n_experts, gating_type='soft')
         
-        # 8 complete experts
+        # N KoopmanAE experts (each is a complete KoopmanAE from Model 4)
         self.experts = nn.ModuleList([
-            CompleteExpert(n_x=n_x, n_z=n_z, expert_id=i)
+            KoopmanAE(n_x=n_x, n_z=n_z, hidden=hidden, expert_id=i)
             for i in range(n_experts)
         ])
         
@@ -335,66 +269,61 @@ class KoopmanMoE(nn.Module):
         weights_history = torch.stack(weights_history)
         
         return predictions, weights_history
-
-
-def spectral_radius_penalty(A, iters=10, target=1.05):
-    """
-    Compute spectral radius penalty using power iteration
     
-    Args:
-        A: matrix to compute spectral radius of
-        iters: number of power iteration steps
-        target: target spectral radius (penalize if > target)
+    def sparsity_loss(self, mode: str = "l1"):
+        """
+        Compute total sparsity loss across all experts
+        
+        Args:
+            mode: 'l1' (default) or 'l2'
+        
+        Returns:
+            total sparsity penalty (scalar)
+        """
+        total_sparsity = 0
+        for expert in self.experts:
+            total_sparsity += expert.sparsity_loss(mode=mode)
+        return total_sparsity / self.n_experts
     
-    Returns:
-        penalty value
-    """
-    v = torch.randn(A.shape[0], 1, device=A.device)
-    v = v / (v.norm() + 1e-9)
-    for _ in range(iters):
-        v = A @ v
-        v = v / (v.norm() + 1e-12)
-    Av = A @ v
-    rho = (v.squeeze() * Av.squeeze()).sum()
-    penalty = F.relu(rho - target)**2
-    return penalty
-
-
-def hankel_stack_batch(z_seq, L):
-    """
-    Build Hankel matrix from sequence of latent states
+    def get_expert_latent_sequences(self, x_sequence):
+        """
+        Get latent sequences for each expert (for Hankel loss computation)
+        
+        Args:
+            x_sequence: tensor of shape (batch, T, n_x) - sequence of states
+        
+        Returns:
+            list of tensors, each (batch, T, n_z) - latent sequences per expert
+        """
+        batch, T, n_x = x_sequence.shape
+        expert_z_seqs = []
+        
+        for expert in self.experts:
+            # Encode all time steps for this expert
+            x_flat = x_sequence.reshape(-1, n_x)
+            z_flat = expert.encoder(x_flat)
+            z_seq = z_flat.reshape(batch, T, -1)
+            expert_z_seqs.append(z_seq)
+        
+        return expert_z_seqs
     
-    Args:
-        z_seq: tensor of shape (B, T, n_z)
-        L: window length for Hankel stacking
-    
-    Returns:
-        Hankel matrix of shape (B, cols, L*n_z)
-    """
-    B, T, nz = z_seq.shape
-    cols = T - L + 1
-    H = []
-    for i in range(cols):
-        block = z_seq[:, i:i+L, :].reshape(B, -1)
-        H.append(block)
-    H = torch.stack(H, dim=1)
-    return H
-
-
-def compute_hankel_svd(H):
-    """
-    Compute SVD of Hankel matrix
-    
-    Args:
-        H: Hankel matrix of shape (B, cols, d)
-    
-    Returns:
-        U, S, Vt from SVD decomposition
-    """
-    B, cols, d = H.shape
-    M = H.reshape(B*cols, d).cpu().numpy()
-    M_centered = M - M.mean(axis=0, keepdims=True)
-    U, S, Vt = np.linalg.svd(M_centered, full_matrices=False)
-    return U, S, Vt
-
-
+    def hankel_linearity_loss(self, x_sequence, L=4, r=8, device='cpu'):
+        """
+        Compute Hankel-based linearity loss for all experts
+        
+        Args:
+            x_sequence: tensor of shape (batch, T, n_x) - sequence of states
+            L: Hankel window length
+            r: rank for SVD truncation
+            device: torch device
+        
+        Returns:
+            average Hankel linearity loss across experts
+        """
+        expert_z_seqs = self.get_expert_latent_sequences(x_sequence)
+        
+        total_hankel_loss = 0
+        for z_seq in expert_z_seqs:
+            total_hankel_loss += compute_hankel_linearity_loss(z_seq, L=L, r=r, device=device)
+        
+        return total_hankel_loss / self.n_experts
