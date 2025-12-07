@@ -1,0 +1,32 @@
+ARIMA Baseline Metrics
+==================================================
+Method: var
+VAR Lag Order: 10
+
+Training Metrics:
+  mse: 1.322850
+  rmse: 1.150152
+  mae: 0.968532
+  mean_phase_error: 1.498777
+  max_phase_error: 3.626329
+
+Validation Metrics:
+  mse: 1.496273
+  rmse: 1.223222
+  mae: 1.010724
+  mean_phase_error: 1.569352
+  max_phase_error: 4.454030
+
+Test Metrics:
+  mse: 1.627765
+  rmse: 1.275839
+  mae: 1.032965
+  mean_phase_error: 1.596476
+  max_phase_error: 5.159445
+
+Trajectory Metrics:
+  mse: 9.690581
+  rmse: 3.112970
+  mae: 2.960073
+  mean_phase_error: 4.385654
+  max_phase_error: 4.952659
