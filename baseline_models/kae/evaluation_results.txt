@@ -1,0 +1,21 @@
+Koopman AE Baseline Evaluation Results
+==================================================
+
+1-Step MSE: 0.005882
+
+Multi-Step NRMSE:
+  Horizon 1: 0.063604
+  Horizon 5: 0.042619
+  Horizon 10: 0.058082
+  Horizon 20: 0.028169
+  Horizon 50: 0.987767
+  Horizon 100: 2.612319
+
+Chamfer Distance (Phase Portrait): 0.000108
+
+Spectral Radius of A_f: 1.006336
+
+Reconstruction Error: 0.005202
+
+Long-Horizon Divergence Rate: 0.021798
+  (Positive = exponential growth, Negative = decay)
