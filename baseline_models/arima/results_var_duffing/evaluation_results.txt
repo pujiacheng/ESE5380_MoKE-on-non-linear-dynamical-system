@@ -1,0 +1,20 @@
+VAR Baseline Evaluation Results
+==================================================
+
+1-Step MSE: 0.450775
+
+Multi-Step NRMSE:
+  Horizon 1: 0.178019
+  Horizon 5: 0.164062
+  Horizon 10: 0.196903
+  Horizon 20: 0.225152
+  Horizon 50: 0.389369
+  Horizon 100: 1.993326
+
+Chamfer Distance (Phase Portrait): 0.000108
+
+Spectral Radius of VAR Companion Matrix: 0.997746
+VAR Lag Order: 10
+
+Long-Horizon Divergence Rate: 0.015131
+  (Positive = exponential growth, Negative = decay)
