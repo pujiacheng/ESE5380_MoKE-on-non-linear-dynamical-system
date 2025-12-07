@@ -1,0 +1,22 @@
+eDMD Baseline Evaluation Results
+==================================================
+
+1-Step MSE: 0.000823
+
+Multi-Step NRMSE:
+  Horizon 1: 0.021387
+  Horizon 5: 0.025760
+  Horizon 10: 0.100102
+  Horizon 20: 0.187823
+  Horizon 50: 0.179617
+  Horizon 100: 0.588696
+
+Chamfer Distance (Phase Portrait): 0.000108
+
+Spectral Radius of K: 1.006770
+
+Observables Prediction MSE: 0.002512
+Observables Prediction RMSE: 0.050119
+
+Long-Horizon Divergence Rate: 0.012079
+  (Positive = exponential growth, Negative = decay)
