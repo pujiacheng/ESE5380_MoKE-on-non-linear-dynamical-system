@@ -39,6 +39,16 @@ from evaluation import (
 )
 
 
+# ==============================================================================
+# Training and Evaluation Horizons
+# ==============================================================================
+# TRAINING: Dense horizons (1-100) for proper Koopman linearity enforcement
+TRAINING_HORIZONS = list(range(1, 101))  # [1, 2, 3, ..., 100]
+
+# EVALUATION: Sparse horizons including extrapolation beyond training
+EVAL_HORIZONS = [1, 10, 50, 100, 500, 1000]
+
+
 def prepare_data_from_trajectories(trajs, hankel_seq_len=16):
     """
     Convert trajectory data to training tuples for multi-step linearity
@@ -53,7 +63,7 @@ def prepare_data_from_trajectories(trajs, hankel_seq_len=16):
     n_traj, n_timesteps, n_x = trajs.shape
     
     # Horizons for multi-step linearity (up to 50 steps) - same as MoE
-    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    horizons = TRAINING_HORIZONS  # Dense: [1, 2, 3, ..., 100]
     max_horizon = max(horizons)
     
     # Initialize lists for each horizon
@@ -164,33 +174,16 @@ def compute_loss(model, data_batch, device, sequences=None):
     # z_{t+k} should equal A_f^k @ z_t for k = 1, 10, 20, ..., 50
     # Uniform weights (same as MoE)
     
-    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-    horizon_weights = {1: 1.0, 10: 1.0, 20: 1.0, 30: 1.0, 40: 1.0, 50: 1.0, 60: 1.0, 70: 1.0, 80: 1.0, 90: 1.0, 100: 1.0}
-    
+    # Multi-step linearity - compute A^k incrementally (efficient for dense horizons)
     loss_lin = 0
-    
-    # Pre-compute A^k for efficiency
-    A_powers = {1: model.A_f}
     A_k = model.A_f.clone()
-    for k in [10, 20, 30, 40, 50]:
-        prev_k = horizons[horizons.index(k) - 1]
-        for _ in range(k - prev_k):
-            A_k = A_k @ model.A_f
-        A_powers[k] = A_k.clone()
-    
-    # Compute linearity loss for each horizon (z0 already computed above)
-    for k in horizons:
+    for k in TRAINING_HORIZONS:  # [1, 2, 3, ..., 100]
         x_k = data_batch[f'x{k}']
-        w_k = horizon_weights[k]
-        
         zk_true = model.encoder(x_k)
-        zk_pred = z0 @ A_powers[k].T
-        
-        loss_lin += w_k * mse(zk_pred, zk_true)
-    
-    # Normalize by sum of weights
-    total_weight = sum(horizon_weights.values())
-    loss_lin = loss_lin / total_weight
+        zk_pred = z0 @ A_k.T
+        loss_lin += mse(zk_pred, zk_true)
+        A_k = A_k @ model.A_f  # A^(k+1) = A^k @ A
+    loss_lin /= len(TRAINING_HORIZONS)
     
     # === 4. Bidirectional Constraint ===
     # A_f @ A_b ≈ I (ensures reversibility)
@@ -259,7 +252,7 @@ def train_model(model, train_loader, device, n_epochs=40, val_loader=None,
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     log = []
-    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    horizons = TRAINING_HORIZONS  # Dense: [1, 2, 3, ..., 100]
     
     # Early stopping tracking
     best_val_total = float('inf')
@@ -450,8 +443,8 @@ def compute_all_metrics(model, true, preds, x_rec, device):
     # 1-step MSE
     metrics['one_step_mse'] = one_step_mse(true_3d[:, :2, :], preds_3d[:, :2, :])
     
-    # Multi-step NRMSE at various horizons
-    horizons = [1, 10, 20, 50, 100]
+    # Multi-step NRMSE at various horizons (including extrapolation)
+    horizons = EVAL_HORIZONS  # [1, 10, 50, 100, 500, 1000]
     nrmse_dict = multi_step_nrmse(true_3d, preds_3d, horizons)
     for h, val in nrmse_dict.items():
         metrics[f'nrmse_{h}step'] = val
@@ -558,7 +551,7 @@ def main():
         print("\nPreparing training data with multi-step linearity horizons...")
         data_dict = prepare_data_from_trajectories(trajs_train, hankel_seq_len=16)
         
-        horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        horizons = TRAINING_HORIZONS  # Dense: [1, 2, 3, ..., 100]
         print(f"  Linearity horizons: {horizons}")
         print(f"  Horizon weights: uniform (all 1.0)")
         

@@ -180,7 +180,7 @@ def simulate_system(system_type, initial_conditions, T=10.0, dt=0.01,
 # Generate dataset with multiple trajectories
 # ============================================================================
 def generate_dataset(system_type, n_traj=100, T=10.0, dt=0.01, noise_std=0.0,
-                     ic_range=None, **system_params):
+                     ic_range=None, show_progress=False, **system_params):
     """
     Generate multiple trajectories for a system
     
@@ -191,6 +191,7 @@ def generate_dataset(system_type, n_traj=100, T=10.0, dt=0.01, noise_std=0.0,
         dt: time step
         noise_std: noise standard deviation
         ic_range: dict with ranges for initial conditions (defaults provided)
+        show_progress: whether to show progress bar
         **system_params: system-specific parameters
     
     Returns:
@@ -213,7 +214,16 @@ def generate_dataset(system_type, n_traj=100, T=10.0, dt=0.01, noise_std=0.0,
     trajs = []
     all_derivatives = []
     
-    for _ in range(n_traj):
+    # Progress tracking
+    iterator = range(n_traj)
+    if show_progress:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc=f"Generating {system_type}", leave=False)
+        except ImportError:
+            pass  # Fall back to no progress bar
+    
+    for _ in iterator:
         # Generate random initial conditions
         if system_type == 'duffing':
             ic = [np.random.uniform(*ic_range['x']),
@@ -563,9 +573,27 @@ def simulate_duffing(x0, xdot0, T=10.0, dt=0.01, noise_std=0.0):
     return t, traj
 
 
-def generate_duffing_dataset(n_traj=100, T=10.0, dt=0.01, noise_std=0.0):
+def generate_duffing_dataset(n_traj=100, T=10.0, dt=0.01, noise_std=0.0, show_progress=False):
     """Backward compatibility wrapper for Duffing dataset generation"""
-    t, trajs, _ = generate_dataset('duffing', n_traj=n_traj, T=T, dt=dt, noise_std=noise_std)
+    t, trajs, _ = generate_dataset('duffing', n_traj=n_traj, T=T, dt=dt, noise_std=noise_std, show_progress=show_progress)
+    return t, trajs
+
+
+def generate_vanderpol_dataset(n_traj=100, T=10.0, dt=0.01, noise_std=0.0, show_progress=False):
+    """Backward compatibility wrapper for Van der Pol dataset generation"""
+    t, trajs, _ = generate_dataset('vanderpol', n_traj=n_traj, T=T, dt=dt, noise_std=noise_std, show_progress=show_progress)
+    return t, trajs
+
+
+def generate_lorenz_dataset(n_traj=100, T=10.0, dt=0.01, noise_std=0.0, show_progress=False):
+    """Backward compatibility wrapper for Lorenz dataset generation"""
+    t, trajs, _ = generate_dataset('lorenz', n_traj=n_traj, T=T, dt=dt, noise_std=noise_std, show_progress=show_progress)
+    return t, trajs
+
+
+def generate_double_pendulum_dataset(n_traj=100, T=10.0, dt=0.01, noise_std=0.0, show_progress=False):
+    """Backward compatibility wrapper for Double Pendulum dataset generation"""
+    t, trajs, _ = generate_dataset('double_pendulum', n_traj=n_traj, T=T, dt=dt, noise_std=noise_std, show_progress=show_progress)
     return t, trajs
 
 

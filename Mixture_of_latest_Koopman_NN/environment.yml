@@ -11,6 +11,7 @@ dependencies:
   - matplotlib>=3.6
   - scipy>=1.10
   - scikit-learn>=1.2
+  - tqdm>=4.64
   - pip
   - pip:
     - statsmodels>=0.14

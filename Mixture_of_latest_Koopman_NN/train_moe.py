@@ -31,6 +31,16 @@ from evaluation import (
 )
 
 
+# ==============================================================================
+# Training and Evaluation Horizons
+# ==============================================================================
+# TRAINING: Dense horizons (1-100) for proper Koopman linearity enforcement
+TRAINING_HORIZONS = list(range(1, 101))  # [1, 2, 3, ..., 100]
+
+# EVALUATION: Sparse horizons including extrapolation beyond training
+EVAL_HORIZONS = [1, 10, 50, 100, 500, 1000]
+
+
 def prepare_data_from_trajectories(trajs, hankel_seq_len=16):
     """
     Convert trajectory data to training tuples for multi-step linearity
@@ -44,8 +54,8 @@ def prepare_data_from_trajectories(trajs, hankel_seq_len=16):
     """
     n_traj, n_timesteps, n_x = trajs.shape
     
-    # Horizons for multi-step linearity (up to 50 steps)
-    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    # Dense horizons for proper Koopman linearity enforcement
+    horizons = TRAINING_HORIZONS  # [1, 2, 3, ..., 100]
     max_horizon = max(horizons)
     
     # Initialize lists for each horizon
@@ -107,137 +117,111 @@ def sample_sequence_batch(sequences, batch_size):
 
 def compute_loss_moe(model, data_batch, device, sequences=None):
     """
-    Compute loss for MoE Koopman model
+    Compute loss for MoKE with TRUE Linear Dynamics (IC Gating).
+    
+    KEY: Initial-Condition (IC) Gating
+    - K_eff = Σ π_k(z_0) · K_k  is computed ONCE from z_0
+    - Then: z_t = K_eff^t · z_0  (true linear dynamics!)
+    
+    This preserves Koopman structure for multi-step prediction.
     
     Args:
         model: KoopmanMoE model
-        data_batch: dict with 'x0', 'x1', 'x10', 'x20', ..., 'x50'
+        data_batch: dict with 'x0', 'x1', 'x10', 'x20', ..., 'x100'
         device: device to run on
         sequences: optional tensor (batch, T, n_x) for Hankel loss
-    
-    Includes:
-    1. Reconstruction loss (per expert, weighted by gating)
-    2. Prediction loss (1-step)
-    3. Multi-step latent linearity (1, 10, 20, ..., 50 steps)
-    4. Load balancing (ensure all experts used)
-    5. Bidirectional constraint (per expert)
-    6. Spectral radius penalty (per expert)
-    7. Hankel-based linearity (HAVOK constraint)
-    8. Sparsity regularization (on encoder/decoder weights)
     """
     # Hyperparameters
     lam_rec = 2.0       # 1. Reconstruction
     lam_pred = 15.0     # 2. 1-step prediction (PRIMARY)
     lam_lin = 12.0      # 3. Multi-step linearity (KOOPMAN CORE)
-    lam_balance = 1.0   # 4. Load balancing (prevent expert collapse)
+    lam_balance = 1.0   # 4. Load balancing
     lam_bi = 1.0        # 5. Bidirectional
-    lam_spec = 5.0      # 6. Spectral radius (stability)
-    lam_hankel = 1.0    # 7. Hankel linearity (HAVOK)
-    lam_sparse = 1e-4   # 8. Sparsity (regularization)
+    lam_spec = 5.0      # 6. Spectral radius
+    lam_hankel = 1.0    # 7. Hankel linearity
+    lam_sparse = 1e-4   # 8. Sparsity
     
     # Extract data
     x0 = data_batch['x0']
     x1 = data_batch['x1']
+    n_experts = model.n_experts
     
     mse = nn.MSELoss()
     
-    # Forward pass for current state
-    out0 = model(x0)
-    weights0 = out0['weights']  # (batch, n_experts)
-    x_rec_blended = out0['x_rec']  # (batch, n_x)
+    # === Encode initial state ===
+    z0 = model.encoder(x0)
+    
+    # === Compute K_eff ONCE from z_0 (IC Gating!) ===
+    K_eff, pi = model.compute_effective_K(z0)
+    # K_eff: (batch, n_z, n_z) - FIXED for this sample's trajectory
+    # pi: (batch, n_experts) - gating weights
     
     # === 1. Reconstruction Loss ===
-    # Blended reconstruction should match input
-    loss_rec = mse(x_rec_blended, x0)
+    x_rec = model.decoder(z0)
+    loss_rec = mse(x_rec, x0)
     
-    # === 2. Prediction Loss (1-step) ===
-    # Each expert predicts next state
-    loss_pred = 0
-    expert_preds = []
-    for expert in model.experts:
-        x1_pred = expert.predict_next(x0)
-        expert_preds.append(x1_pred)
+    # === 2. Prediction Loss (1-step with K_eff) ===
+    # z1 = K_eff @ z0 (batched matrix-vector multiply)
+    z1_pred = torch.bmm(K_eff, z0.unsqueeze(-1)).squeeze(-1)
+    x1_pred = model.decoder(z1_pred)
+    loss_pred = mse(x1_pred, x1)
     
-    # Blend predictions
-    x1_pred_blended = model.blending(expert_preds, weights0)
-    loss_pred = mse(x1_pred_blended, x1)
-    
-    # === 3. Multi-Step Latent Linearity (per expert) ===
-    # z_{t+k} should equal A_f^k @ z_t for k = 1, 10, 20, ..., 50
-    # Weight smaller steps MORE than larger steps (easier to satisfy, more important)
-    
-    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-    # Uniform weights: all horizons equally important
-    horizon_weights = {
-        1: 1.0,
-        10: 1.0,
-        20: 1.0,
-        30: 1.0,
-        40: 1.0,
-        50: 1.0
-    }
+    # === 3. Multi-Step Latent Linearity with FIXED K_eff ===
+    # z_h = K_eff^h @ z_0 (true Koopman!)
+    horizons = TRAINING_HORIZONS  # Dense: [1, 2, 3, ..., 100]
     
     loss_lin = 0
+    count = 0
     
-    # Pre-compute A^k for each expert (for efficiency)
-    A_powers = {}
-    for i, expert in enumerate(model.experts):
-        A_powers[i] = {1: expert.A_f}
-        A_k = expert.A_f.clone()
-        for k in [10, 20, 30, 40, 50]:
-            # Compute A^k by repeated multiplication from previous power
-            prev_k = horizons[horizons.index(k) - 1]
-            for _ in range(k - prev_k):
-                A_k = A_k @ expert.A_f
-            A_powers[i][k] = A_k.clone()
+    # Pre-compute K_eff^h using matrix powers
+    K_eff_powers = {1: K_eff}
+    K_power = K_eff.clone()
+    prev_h = 1
+    for h in horizons[1:]:
+        for _ in range(h - prev_h):
+            K_power = torch.bmm(K_power, K_eff)
+        K_eff_powers[h] = K_power.clone()
+        prev_h = h
     
-    # Compute linearity loss for each horizon
-    for k in horizons:
-        x_k = data_batch[f'x{k}']
-        w_k = horizon_weights[k]
+    for h in horizons:
+        if f'x{h}' not in data_batch:
+            continue
+        x_h = data_batch[f'x{h}']
+        zh_true = model.encoder(x_h)
         
-        for i, expert in enumerate(model.experts):
-            z0 = expert.encoder(x0)
-            zk_true = expert.encoder(x_k)
-            zk_pred = z0 @ A_powers[i][k].T
-            
-            # Weight by gating AND by horizon importance
-            loss_lin += w_k * (weights0[:, i:i+1] * (zk_pred - zk_true)**2).mean()
+        # z_h = K_eff^h @ z_0 (using pre-computed powers)
+        zh_pred = torch.bmm(K_eff_powers[h], z0.unsqueeze(-1)).squeeze(-1)
+        
+        loss_lin += mse(zh_pred, zh_true)
+        count += 1
     
-    # Normalize by sum of weights
-    total_weight = sum(horizon_weights.values())
-    loss_lin = loss_lin / total_weight
+    loss_lin = loss_lin / max(count, 1)
     
     # === 4. Load Balancing Loss ===
-    # Ensure all experts are used roughly equally (prevents expert collapse)
-    avg_weights = weights0.mean(dim=0)  # Average over batch
-    target_weight = 1.0 / model.n_experts
-    loss_balance = ((avg_weights - target_weight)**2).sum()
+    avg_pi = pi.mean(dim=0)
+    target_weight = 1.0 / n_experts
+    loss_balance = ((avg_pi - target_weight)**2).sum()
     
-    # === 5. Bidirectional Constraint (per expert) ===
-    # A_f @ A_b ≈ I (ensures reversibility)
+    # === 5. Bidirectional Constraint ===
     loss_bi = 0
     I = torch.eye(model.n_z, device=device)
-    for expert in model.experts:
-        loss_bi += (expert.A_f @ expert.A_b - I).norm()**2
-        loss_bi += (expert.A_b @ expert.A_f - I).norm()**2
-    loss_bi /= model.n_experts
+    for k in range(n_experts):
+        loss_bi += (model.K[k] @ model.K_b[k] - I).norm()**2
+        loss_bi += (model.K_b[k] @ model.K[k] - I).norm()**2
+    loss_bi /= n_experts
     
-    # === 6. Spectral Radius Penalty (per expert) ===
-    # Prevent explosive dynamics (keep eigenvalues bounded)
+    # === 6. Spectral Radius Penalty ===
     loss_spec = 0
-    for expert in model.experts:
-        loss_spec += spectral_radius_penalty(expert.A_f, iters=8, target=1.005, lower=0.995)
-    loss_spec /= model.n_experts
+    for k in range(n_experts):
+        loss_spec += spectral_radius_penalty(model.K[k], iters=8, target=1.005, lower=0.995)
+    loss_spec /= n_experts
     
-    # === 7. Hankel-Based Linearity Loss (per expert) ===
-    # Uses HAVOK: delay embedding should have linear dynamics
+    # === 7. Hankel-Based Linearity Loss ===
     loss_hankel = torch.tensor(0.0, device=device)
     if sequences is not None and len(sequences) > 0:
         loss_hankel = model.hankel_linearity_loss(sequences, L=4, r=8, device=device)
     
     # === 8. Sparsity Regularization ===
-    # L1 penalty on encoder/decoder weights across all experts
     loss_sparse = model.sparsity_loss(mode="l1")
     
     # === Total Loss ===
@@ -322,7 +306,7 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
                 x50_sample = sample_batch[6][:32].to(device)  # x50
                 
                 print("\n" + "="*80)
-                print("🔍 DEBUG: Epoch 0 Initial State Analysis")
+                print("🔍 DEBUG: Epoch 0 - MoKE with IC Gating (True Linear Dynamics)")
                 print("="*80)
                 
                 # Input data statistics
@@ -335,30 +319,39 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
                 print(f"   Mean: {x50_sample.mean().item():.6f}, Std: {x50_sample.std().item():.6f}")
                 print(f"   |x50 - x0| mean: {(x50_sample - x0_sample).abs().mean().item():.6f}")
                 
-                # Per-expert analysis
-                print(f"\n🧠 Expert Analysis:")
-                for i, expert in enumerate(model.experts):
-                    z0 = expert.encoder(x0_sample)
-                    z50_true = expert.encoder(x50_sample)
-                    
-                    # A^50
-                    A_power = expert.A_f
-                    for _ in range(49):
-                        A_power = A_power @ expert.A_f
-                    z50_pred = z0 @ A_power.T
-                    
-                    # Spectral radius
-                    eigvals = torch.linalg.eigvals(expert.A_f)
+                # Encode and compute K_eff
+                z0 = model.encoder(x0_sample)
+                z50_true = model.encoder(x50_sample)
+                K_eff, pi = model.compute_effective_K(z0)
+                
+                print(f"\n🔧 Shared Encoder/Decoder:")
+                print(f"   Latent z0:  mean={z0.mean().item():.4f}, std={z0.std().item():.4f}")
+                print(f"   Latent z50: mean={z50_true.mean().item():.4f}, std={z50_true.std().item():.4f}")
+                
+                print(f"\n🎯 IC Gating (computed from z_0, FIXED for trajectory):")
+                print(f"   Mean weights: {pi.mean(dim=0).cpu().numpy()}")
+                
+                # K_eff analysis
+                print(f"\n📐 Effective K_eff = Σ π_k K_k:")
+                K_eff_mean = K_eff.mean(dim=0)
+                eigvals_eff = torch.linalg.eigvals(K_eff_mean)
+                spec_radius_eff = eigvals_eff.abs().max().item()
+                print(f"   K_eff spectral radius (mean): {spec_radius_eff:.4f}")
+                
+                # K_eff^50 prediction (TRUE Koopman!)
+                K_power = K_eff.clone()
+                for _ in range(49):
+                    K_power = torch.bmm(K_power, K_eff)
+                z50_pred = torch.bmm(K_power, z0.unsqueeze(-1)).squeeze(-1)
+                print(f"   z50 = K_eff^50 @ z0 error: {(z50_pred - z50_true).abs().mean().item():.6f}")
+                
+                # Per-Koopman operator analysis
+                print(f"\n🧠 Individual Koopman Operators:")
+                for i in range(model.n_experts):
+                    K = model.K[i]
+                    eigvals = torch.linalg.eigvals(K)
                     spec_radius = eigvals.abs().max().item()
-                    
-                    print(f"\n   Expert {i+1}:")
-                    print(f"     Latent z0:  mean={z0.mean().item():.4f}, std={z0.std().item():.4f}, "
-                          f"min={z0.min().item():.4f}, max={z0.max().item():.4f}")
-                    print(f"     Latent z50_true: mean={z50_true.mean().item():.4f}, std={z50_true.std().item():.4f}")
-                    print(f"     Latent z50_pred: mean={z50_pred.mean().item():.4f}, std={z50_pred.std().item():.4f}")
-                    print(f"     |z50_pred - z50_true|: {(z50_pred - z50_true).abs().mean().item():.6f}")
-                    print(f"     A_f spectral radius: {spec_radius:.4f}")
-                    print(f"     A^50 norm: {A_power.norm().item():.4f}")
+                    print(f"   K_{i+1}: spectral radius = {spec_radius:.4f}")
                 
                 print("\n" + "="*80 + "\n")
             model.train()
@@ -368,8 +361,8 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
         epoch_losses = []
         
         for batch in train_loader:
-            # batch is a tuple of tensors: (x0, x1, x10, x20, ..., x50)
-            horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            # batch is a tuple of tensors: (x0, x1, x2, ..., x100)
+            horizons = TRAINING_HORIZONS  # Dense: [1, 2, 3, ..., 100]
             data_batch = {'x0': batch[0].to(device)}
             for idx, h in enumerate(horizons):
                 data_batch[f'x{h}'] = batch[idx + 1].to(device)
@@ -400,7 +393,7 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
             val_losses = []
             with torch.no_grad():
                 for batch in val_loader:
-                    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+                    horizons = TRAINING_HORIZONS  # Dense: [1, 2, 3, ..., 100]
                     data_batch = {'x0': batch[0].to(device)}
                     for idx, h in enumerate(horizons):
                         data_batch[f'x{h}'] = batch[idx + 1].to(device)
@@ -472,7 +465,7 @@ def train_model_moe(model, train_loader, device, n_epochs=40, val_loader=None,
 
 def evaluate_model_moe(model, test_traj, device, n_steps=100):
     """
-    Evaluate MoE model by predicting forward in time using metrics from evaluation.py
+    Evaluate MoKE model by predicting forward in time
     
     Args:
         model: trained KoopmanMoE model
@@ -485,7 +478,6 @@ def evaluate_model_moe(model, test_traj, device, n_steps=100):
         preds: predicted trajectory
         weights: expert weights over time
         x_rec: reconstructed initial condition
-        metrics: dict with all evaluation metrics
     """
     model.eval()
     
@@ -493,10 +485,10 @@ def evaluate_model_moe(model, test_traj, device, n_steps=100):
         x0 = torch.tensor(test_traj[0], dtype=torch.float32).unsqueeze(0).to(device)
         
         # Get reconstruction of initial condition
-        x_rec, _ = model(x0)
-        x_rec = x_rec.cpu().numpy()
+        out = model(x0)
+        x_rec = out['x_rec'].cpu().numpy()
         
-        # Get predictions
+        # Get predictions using the new architecture
         preds, weights = model.predict(x0, n_steps=n_steps)
         
         preds = preds.squeeze(1).cpu().numpy()  # Remove batch dim
@@ -508,7 +500,7 @@ def evaluate_model_moe(model, test_traj, device, n_steps=100):
 
 def compute_all_metrics_moe(model, true, preds, x_rec, device):
     """
-    Compute all evaluation metrics from evaluation.py for MoE model
+    Compute all evaluation metrics from evaluation.py for MoKE model
     
     Args:
         model: trained KoopmanMoE model
@@ -542,10 +534,10 @@ def compute_all_metrics_moe(model, true, preds, x_rec, device):
     if len(dims) == 2:
         metrics['chamfer_distance'] = chamfer_distance_phase(true_3d, preds_3d, dims=dims)
     
-    # Spectral radius of each expert's Koopman operator (report max)
+    # Spectral radius of each Koopman operator (report max)
     max_rho = 0.0
-    for expert in model.experts:
-        K = expert.A_f.detach().cpu().numpy()
+    for i in range(model.n_experts):
+        K = model.K[i].detach().cpu().numpy()
         rho, _ = spectral_radius(K)
         max_rho = max(max_rho, rho)
     metrics['spectral_radius_max'] = max_rho
@@ -707,9 +699,9 @@ def main():
     print("\nPreparing training data with multi-step linearity horizons...")
     data_dict = prepare_data_from_trajectories(trajs_train, hankel_seq_len=16)
     
-    # Horizons used (up to 50 steps)
-    horizons = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-    print(f"  Linearity horizons: {horizons}")
+    # Dense horizons for proper Koopman linearity enforcement
+    horizons = TRAINING_HORIZONS  # [1, 2, 3, ..., 100]
+    print(f"  Linearity horizons: {len(horizons)} steps (dense 1-100)")
     print(f"  Horizon weights: uniform (all 1.0)")
     
     # Hankel sequences for HAVOK constraint
@@ -949,7 +941,7 @@ def main():
     axes[1, 2].grid(True, alpha=0.3, axis='y')
     
     # Row 2, Col 3: NRMSE at specific horizons (averaged)
-    eval_horizons = [1, 10, 20, 50, 100]
+    eval_horizons = EVAL_HORIZONS  # [1, 10, 50, 100, 500, 1000]
     horizon_nrmse = [avg_metrics.get(f'nrmse_{h}step', np.nan) for h in eval_horizons]
     colors = ['green' if h <= 50 else 'red' for h in eval_horizons]
     axes[1, 3].bar(range(len(eval_horizons)), horizon_nrmse, color=colors)

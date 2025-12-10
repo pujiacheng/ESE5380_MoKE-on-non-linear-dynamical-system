@@ -61,27 +61,66 @@ def one_step_mse(x_true, x_pred, plot=False):
     return float(mse)
 
 
-def multi_step_nrmse(x_true, x_pred, horizons, sigma_test=None, plot=False):
+def multi_step_nrmse(x_true, x_pred, horizons, sigma_per_dim=None, plot=False):
     """
-    Compute NRMSE(T) for multiple horizons.
-    If plot=True → draw NRMSE vs Horizon curve.
+    Compute CUMULATIVE NRMSE(T) for multiple horizons with per-dimension normalization.
+    
+    NRMSE(T) = sqrt(mean over t in [1..T], batch, dims of ((x_true - x_pred) / sigma_dim)^2)
+    
+    This is cumulative: measures average error from step 1 up to step T.
+    Normalization is per-dimension to handle different scales (e.g., angles vs velocities).
+    
+    Args:
+        x_true: Ground truth trajectories (n_batch, n_steps, n_dims)
+        x_pred: Predicted trajectories (n_batch, n_steps, n_dims)
+        horizons: List of time horizons to evaluate
+        sigma_per_dim: Optional per-dimension std for normalization (n_dims,)
+        plot: If True, plot NRMSE vs horizon
+    
+    Returns:
+        results: Dict mapping horizon T to cumulative NRMSE value
+                 Returns np.nan for horizons that exceed trajectory length
     """
     x_true = to_tensor(x_true)
     x_pred = to_tensor(x_pred)
 
+    # Validate shapes
+    assert x_true.shape == x_pred.shape, \
+        f"Shape mismatch: x_true={x_true.shape}, x_pred={x_pred.shape}"
+    assert x_true.dim() == 3, \
+        f"Expected 3D tensor (batch, time, dims), got {x_true.dim()}D"
+
     n, t_max, d = x_true.shape
 
-    if sigma_test is None:
-        sigma_test = torch.std(x_true.reshape(n * t_max, d)) + 1e-8
+    # Per-dimension normalization: compute std for each dimension separately
+    if sigma_per_dim is None:
+        # Shape: (d,) - one std per dimension
+        sigma_per_dim = torch.std(x_true, dim=(0, 1)) + 1e-8
+        
+        # Warn if any dimension has near-zero variance
+        if torch.any(sigma_per_dim < 1e-6):
+            import warnings
+            zero_var_dims = torch.where(sigma_per_dim < 1e-6)[0].tolist()
+            warnings.warn(f"Near-zero variance in dimensions {zero_var_dims}. NRMSE may be unreliable.")
 
     results = {}
     for T in horizons:
         if T >= t_max:
+            # Explicitly return nan for horizons beyond trajectory length
+            results[T] = float('nan')
             continue
-        err = x_true[:, T, :] - x_pred[:, T, :]
-        mse_T = torch.mean(torch.sum(err * err, dim=-1))
-        rmse_T = torch.sqrt(mse_T)
-        results[T] = float((rmse_T / sigma_test).item())
+        
+        # CUMULATIVE: error from step 1 up to step T (inclusive)
+        # Shape: (n, T, d)
+        err = x_true[:, 1:T+1, :] - x_pred[:, 1:T+1, :]
+        
+        # Normalize each dimension by its own std
+        # Shape: (n, T, d)
+        err_normalized = err / sigma_per_dim.unsqueeze(0).unsqueeze(0)
+        
+        # NRMSE: sqrt of mean squared normalized error across all dims, times, batches
+        nrmse_T = torch.sqrt(torch.mean(err_normalized ** 2))
+        results[T] = float(nrmse_T.item())
 
     # ------------------- Plot -------------------
     if plot and len(results) > 0:
@@ -92,8 +131,8 @@ def multi_step_nrmse(x_true, x_pred, horizons, sigma_test=None, plot=False):
         plt.figure(figsize=(6,4))
         plt.plot(H, V, marker='o', linewidth=2)
         plt.xlabel("Horizon T")
-        plt.ylabel("NRMSE(T)")
-        plt.title("Multi-step NRMSE vs Horizon")
+        plt.ylabel("Cumulative NRMSE(T)")
+        plt.title("Cumulative NRMSE vs Horizon (Per-Dim Normalized)")
         plt.grid(alpha=0.3)
         plt.tight_layout()
         plt.show()
@@ -101,18 +140,133 @@ def multi_step_nrmse(x_true, x_pred, horizons, sigma_test=None, plot=False):
     return results
 
 
+def multi_step_nrmse_per_dim(x_true, x_pred, horizons, sigma_per_dim=None, plot=False):
+    """
+    Compute CUMULATIVE NRMSE(T) separately for each dimension.
+    
+    Returns per-dimension NRMSE values for detailed analysis.
+    
+    Args:
+        x_true: Ground truth trajectories (n_batch, n_steps, n_dims)
+        x_pred: Predicted trajectories (n_batch, n_steps, n_dims)
+        horizons: List of time horizons to evaluate
+        sigma_per_dim: Optional per-dimension std for normalization (n_dims,)
+        plot: If True, plot NRMSE vs horizon for each dimension
+    
+    Returns:
+        results: Dict mapping horizon T to array of per-dimension NRMSE values
+                 Returns [nan, nan, ...] for horizons that exceed trajectory length
+        aggregate: Dict mapping horizon T to aggregate (mean across dims) NRMSE
+    """
+    x_true = to_tensor(x_true)
+    x_pred = to_tensor(x_pred)
+
+    # Validate shapes
+    assert x_true.shape == x_pred.shape, \
+        f"Shape mismatch: x_true={x_true.shape}, x_pred={x_pred.shape}"
+    assert x_true.dim() == 3, \
+        f"Expected 3D tensor (batch, time, dims), got {x_true.dim()}D"
+
+    n, t_max, d = x_true.shape
+
+    # Per-dimension normalization
+    if sigma_per_dim is None:
+        sigma_per_dim = torch.std(x_true, dim=(0, 1)) + 1e-8
+
+    results = {}
+    aggregate = {}
+    
+    for T in horizons:
+        if T >= t_max:
+            # Explicitly return nan for horizons beyond trajectory length
+            results[T] = [float('nan')] * d
+            aggregate[T] = float('nan')
+            continue
+        
+        # CUMULATIVE: error from step 1 up to step T
+        err = x_true[:, 1:T+1, :] - x_pred[:, 1:T+1, :]
+        
+        # Per-dimension NRMSE
+        per_dim_nrmse = []
+        for dim in range(d):
+            err_dim = err[:, :, dim] / sigma_per_dim[dim]
+            nrmse_dim = torch.sqrt(torch.mean(err_dim ** 2))
+            per_dim_nrmse.append(float(nrmse_dim.item()))
+        
+        results[T] = per_dim_nrmse
+        aggregate[T] = float(np.mean(per_dim_nrmse))
+
+    # ------------------- Plot -------------------
+    if plot and len(results) > 0:
+        import matplotlib.pyplot as plt
+        H = sorted(results.keys())
+        
+        plt.figure(figsize=(8, 5))
+        for dim in range(d):
+            V = [results[h][dim] for h in H]
+            plt.plot(H, V, marker='o', linewidth=2, label=f'Dim {dim}')
+        
+        # Also plot aggregate
+        V_agg = [aggregate[h] for h in H]
+        plt.plot(H, V_agg, 'k--', linewidth=2, label='Mean')
+        
+        plt.xlabel("Horizon T")
+        plt.ylabel("Cumulative NRMSE(T)")
+        plt.title("Per-Dimension Cumulative NRMSE vs Horizon")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    return results, aggregate
+
 
 # -----------------------------------------------------------
 # Phase-portrait fidelity
 # -----------------------------------------------------------
 
-def chamfer_distance_phase(x_true, x_pred, dims=(0, 1), plot=False):
+def chamfer_distance_phase(x_true, x_pred, dims=None, plot=False):
     """
-    Compute Chamfer distance.
-    If plot=True → draw true vs predicted phase portrait.
+    Compute Chamfer distance in phase space.
+    
+    Args:
+        x_true: Ground truth trajectories (n_batch, n_steps, n_dims) or (n_steps, n_dims)
+        x_pred: Predicted trajectories (same shape as x_true)
+        dims: Dimensions to use for Chamfer distance. 
+              If None, uses ALL dimensions (full state space).
+              If tuple/list, uses only specified dimensions.
+        plot: If True and dims has 2 elements, draw phase portrait
+    
+    Returns:
+        chamfer: Chamfer distance value (inf if predictions contain NaN/Inf)
     """
-    x_true_ = flatten_batch_time(to_tensor(x_true))[:, list(dims)]
-    x_pred_ = flatten_batch_time(to_tensor(x_pred))[:, list(dims)]
+    x_true_t = to_tensor(x_true)
+    x_pred_t = to_tensor(x_pred)
+    
+    # Validate shapes match (after potential broadcasting)
+    assert x_true_t.shape[-1] == x_pred_t.shape[-1], \
+        f"Dimension mismatch: x_true has {x_true_t.shape[-1]} dims, x_pred has {x_pred_t.shape[-1]}"
+    
+    x_true_flat = flatten_batch_time(x_true_t)
+    x_pred_flat = flatten_batch_time(x_pred_t)
+    
+    # Use all dimensions if not specified
+    if dims is None:
+        dims = list(range(x_true_flat.shape[-1]))
+    
+    # Validate dims are valid
+    n_dims = x_true_flat.shape[-1]
+    assert all(0 <= d < n_dims for d in dims), \
+        f"Invalid dims {dims} for data with {n_dims} dimensions"
+    
+    x_true_ = x_true_flat[:, list(dims)]
+    x_pred_ = x_pred_flat[:, list(dims)]
+
+    # Check for NaN/Inf - return inf with warning
+    if torch.any(torch.isnan(x_pred_)) or torch.any(torch.isinf(x_pred_)):
+        import warnings
+        warnings.warn("Predictions contain NaN/Inf, returning inf for Chamfer distance")
+        return float('inf')
 
     dist = torch.cdist(x_true_, x_pred_, p=2)
     d12 = torch.mean(torch.min(dist, dim=1).values)
@@ -120,7 +274,7 @@ def chamfer_distance_phase(x_true, x_pred, dims=(0, 1), plot=False):
     chamfer = float((d12 + d21).item())
 
     # ------------------- Plot -------------------
-    if plot:
+    if plot and len(dims) == 2:
         import matplotlib.pyplot as plt
         x_t = x_true_.cpu().numpy()
         x_p = x_pred_.cpu().numpy()
@@ -137,6 +291,16 @@ def chamfer_distance_phase(x_true, x_pred, dims=(0, 1), plot=False):
         plt.show()
 
     return chamfer
+
+
+def chamfer_distance_full_state(x_true, x_pred):
+    """
+    Convenience function: Chamfer distance using ALL state dimensions.
+    
+    This is the mathematically correct way to measure phase space fidelity
+    for systems with more than 2 state variables.
+    """
+    return chamfer_distance_phase(x_true, x_pred, dims=None, plot=False)
 
 
 # -----------------------------------------------------------

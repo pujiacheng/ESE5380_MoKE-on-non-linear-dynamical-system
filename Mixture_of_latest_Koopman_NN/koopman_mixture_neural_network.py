@@ -5,7 +5,7 @@ This module implements a Koopman Autoencoder combining ideas from
 Hankel/HAVOK and a bidirectional factorization of the linear latent operator.
 
 Features:
-- Nonlinear encoder/decoder (deep MLP with BatchNorm)
+- Nonlinear encoder/decoder (deep MLP with LayerNorm for train/eval consistency)
 - Learnable forward A_f and backward A_b matrices with A_f A_b ≈ I constraint
 - Hankel (delay) stacking of latent z to create delay coordinates and enforce linearity
 - Sparsity regularization on encoder/decoder weights
@@ -21,16 +21,23 @@ import numpy as np
 class MLPEncoder(nn.Module):
     """Encoder network: maps state x to latent representation z"""
 
-    def __init__(self, n_in=2, n_latent=6, hidden=128):
+    def __init__(self, n_in=2, n_latent=6, hidden=256):
         super().__init__()
         self.n_in = n_in
         self.n_latent = n_latent
+        # Using LayerNorm instead of BatchNorm for train/eval consistency
         self.net = nn.Sequential(
             nn.Linear(n_in, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, n_latent)
         )
@@ -42,16 +49,23 @@ class MLPEncoder(nn.Module):
 class MLPDecoder(nn.Module):
     """Decoder network: maps latent representation z back to state x"""
 
-    def __init__(self, n_latent=6, n_out=2, hidden=128):
+    def __init__(self, n_latent=6, n_out=2, hidden=256):
         super().__init__()
         self.n_latent = n_latent
         self.n_out = n_out
+        # Using LayerNorm instead of BatchNorm for train/eval consistency
         self.net = nn.Sequential(
             nn.Linear(n_latent, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, n_out)
         )
