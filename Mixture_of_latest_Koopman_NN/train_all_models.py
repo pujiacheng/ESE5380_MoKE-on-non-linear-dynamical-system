@@ -56,6 +56,7 @@ from evaluation import (
     chamfer_distance_full_state,
     spectral_radius as compute_spectral_radius,
     long_horizon_divergence_rate,
+    long_horizon_divergence_rate_per_dim,
     reconstruction_error
 )
 
@@ -154,8 +155,8 @@ def evaluate_predictions(model_name, true_trajs, pred_trajs, n_x, dt):
     all_one_step_mse = []
     all_one_step_mse_per_dim = {d: [] for d in range(n_x)}
     all_nrmse_per_dim = {h: {d: [] for d in range(n_x)} for h in eval_horizons}
-    all_chamfer = []
-    all_divergence = []
+    all_chamfer_per_horizon = {h: [] for h in eval_horizons}  # Chamfer at each horizon
+    all_divergence_per_horizon = {h: {d: [] for d in range(n_x)} for h in eval_horizons}  # Divergence per dim per horizon
     all_recon = []
     all_recon_per_dim = {d: [] for d in range(n_x)}
     
@@ -192,12 +193,21 @@ def evaluate_predictions(model_name, true_trajs, pred_trajs, n_x, dt):
                 for d, val in enumerate(dim_values):
                     all_nrmse_per_dim[h][d].append(val)
         
-        # Chamfer distance (FULL STATE - all dimensions)
-        all_chamfer.append(chamfer_distance_full_state(true_3d, pred_3d))
-        
-        # Divergence rate
-        slope, _ = long_horizon_divergence_rate(true_3d, pred_3d)
-        all_divergence.append(slope)
+        # Chamfer distance and Divergence rate at each horizon (like NRMSE)
+        for h in horizons:
+            # Compute on trajectory up to step h
+            true_h = true_3d[:, :h+1, :]
+            pred_h = pred_3d[:, :h+1, :]
+            
+            # Chamfer
+            chamfer_h = chamfer_distance_full_state(true_h, pred_h)
+            all_chamfer_per_horizon[h].append(chamfer_h)
+            
+            # Divergence rate per dimension (need at least 2 points for linear fit)
+            if h >= 1:
+                slopes_per_dim, _ = long_horizon_divergence_rate_per_dim(true_h, pred_h)
+                for d, slope in enumerate(slopes_per_dim):
+                    all_divergence_per_horizon[h][d].append(slope)
         
         # Reconstruction error (per-dim)
         for d in range(n_x):
@@ -230,28 +240,50 @@ def evaluate_predictions(model_name, true_trajs, pred_trajs, n_x, dt):
         else:
             metrics[f'nrmse_{h}step'] = np.nan
     
-    # Chamfer distance (full state) - HONEST REPORTING
-    # If ANY trajectory diverges, model is unstable → report inf
-    n_total = len(all_chamfer)
-    valid_chamfer = [c for c in all_chamfer if not np.isinf(c)]
-    n_valid = len(valid_chamfer)
-    n_diverged = n_total - n_valid
+    # Chamfer distance at each horizon - HONEST REPORTING (like NRMSE)
+    # If ANY trajectory has inf Chamfer at a horizon → report inf for that horizon
+    for h in eval_horizons:
+        chamfer_vals = all_chamfer_per_horizon[h]
+        if chamfer_vals:
+            # If any inf, report inf (model diverged)
+            if any(np.isinf(c) for c in chamfer_vals):
+                metrics[f'chamfer_{h}step'] = np.inf
+            else:
+                metrics[f'chamfer_{h}step'] = np.mean(chamfer_vals)
+        else:
+            metrics[f'chamfer_{h}step'] = np.nan
     
-    metrics['n_valid'] = n_valid
+    # Track divergence at max horizon for backward compatibility
+    max_h = max([h for h in eval_horizons if all_chamfer_per_horizon[h]], default=100)
+    chamfer_max = all_chamfer_per_horizon.get(max_h, [])
+    n_total = len(chamfer_max)
+    n_diverged = sum(1 for c in chamfer_max if np.isinf(c))
+    metrics['n_valid'] = n_total - n_diverged
     metrics['n_total'] = n_total
     metrics['n_diverged'] = n_diverged
     
-    if n_diverged > 0:
-        # Model is unstable - report inf as primary metric
-        metrics['chamfer_distance'] = np.inf
-        metrics['chamfer_valid_only'] = np.mean(valid_chamfer) if valid_chamfer else np.nan
-    else:
-        # All trajectories valid
-        metrics['chamfer_distance'] = np.mean(valid_chamfer)
-        metrics['chamfer_valid_only'] = metrics['chamfer_distance']
-    
-    # Divergence rate
-    metrics['divergence_rate'] = np.mean(all_divergence)
+    # Divergence rate at each horizon per dimension (like NRMSE)
+    for h in eval_horizons:
+        per_dim_means = []
+        for d in range(n_x):
+            div_vals = all_divergence_per_horizon[h][d]
+            if div_vals:
+                valid_divs = [v for v in div_vals if not np.isnan(v)]
+                if valid_divs:
+                    dim_mean = np.mean(valid_divs)
+                    metrics[f'divergence_{h}step_dim{d}'] = dim_mean
+                    per_dim_means.append(dim_mean)
+                else:
+                    metrics[f'divergence_{h}step_dim{d}'] = np.nan
+            else:
+                metrics[f'divergence_{h}step_dim{d}'] = np.nan
+        
+        # RMS aggregate across dimensions
+        valid_means = [m for m in per_dim_means if not np.isnan(m)]
+        if valid_means:
+            metrics[f'divergence_{h}step'] = np.sqrt(np.mean(np.array(valid_means)**2))
+        else:
+            metrics[f'divergence_{h}step'] = np.nan
     
     # Reconstruction error: per-dim and aggregate (mean of per-dim)
     for d in range(n_x):
@@ -294,22 +326,35 @@ def print_model_metrics(metrics, n_x):
         ])
         print(f"    {h:4d}-step: {agg_val:.4f}  ({per_dim_str})")
     
-    # Chamfer distance (full state) - HONEST REPORTING
-    chamfer = metrics.get('chamfer_distance', np.nan)
-    chamfer_valid = metrics.get('chamfer_valid_only', np.nan)
+    # Chamfer distance at each horizon (like NRMSE)
+    print(f"\n  Chamfer Distance (full state, per horizon):")
+    for h in eval_horizons:
+        chamfer_h = metrics.get(f'chamfer_{h}step', np.nan)
+        if np.isnan(chamfer_h):
+            continue
+        if np.isinf(chamfer_h):
+            print(f"    {h:4d}-step: inf")
+        else:
+            print(f"    {h:4d}-step: {chamfer_h:.4f}")
+    
+    # Summary: diverged count at max horizon
     n_valid = metrics.get('n_valid', 0)
     n_total = metrics.get('n_total', 0)
     n_div = metrics.get('n_diverged', 0)
-    
     if n_div > 0:
-        # Unstable model - show inf with diagnostic info
-        print(f"\n  Chamfer (full state): inf  ({n_valid}/{n_total} valid, valid_avg={chamfer_valid:.4f})")
-    else:
-        print(f"\n  Chamfer (full state): {chamfer:.6f}  ({n_valid}/{n_total} valid)")
+        print(f"    ⚠ {n_div}/{n_total} trajectories diverged")
     
-    # Divergence rate
-    div_rate = metrics.get('divergence_rate', np.nan)
-    print(f"  Divergence rate:      {div_rate:.6f}")
+    # Divergence rate at each horizon (per-dim + RMS aggregate)
+    print(f"\n  Divergence Rate (per-dim, RMS aggregate):")
+    for h in eval_horizons:
+        agg_val = metrics.get(f'divergence_{h}step', np.nan)
+        if np.isnan(agg_val):
+            continue
+        per_dim_str = "  |  ".join([
+            f"d{d}={metrics.get(f'divergence_{h}step_dim{d}', np.nan):.6f}"
+            for d in range(n_x)
+        ])
+        print(f"    {h:4d}-step: {agg_val:.6f}  ({per_dim_str})")
     
     # Reconstruction error (same format as NRMSE)
     agg_recon = metrics.get('reconstruction_error', np.nan)
@@ -941,18 +986,33 @@ def predict_pytorch_model(model, x0, n_steps, device, is_moe=False):
         if is_moe:
             preds, _ = model.predict(x0_tensor, n_steps=n_steps)
             preds = preds.squeeze(1).cpu().numpy()
-        else:
-            # Manual Koopman prediction: z_{k+1} = A @ z_k
+        elif hasattr(model, 'predict_sequence'):
+            # eDMD and KoopmanAE models with predict_sequence method
+            preds = model.predict_sequence(x0_tensor, n_steps)
+            preds = preds.cpu().numpy()
+            # Handle different output shapes:
+            # - eDMD returns (batch, n_steps+1, n_x)
+            # - KoopmanAE returns (n_steps+1, batch, n_x)
+            if preds.shape[0] == 1 and preds.ndim == 3:
+                # (1, n_steps+1, n_x) -> squeeze batch dim
+                preds = preds.squeeze(0)
+            elif preds.shape[1] == 1 and preds.ndim == 3:
+                # (n_steps+1, 1, n_x) -> squeeze batch dim
+                preds = preds.squeeze(1)
+        elif hasattr(model, 'encoder') and hasattr(model, 'A_f'):
+            # KoopmanAE models: z_{k+1} = A @ z_k
             z = model.encoder(x0_tensor)
-            assert z.shape == (1, model.n_z), f"Encoder output shape mismatch: {z.shape}"
+            n_z = z.shape[1]
             
             preds = [x0]  # Start with initial condition
             for _ in range(n_steps):
                 z = z @ model.A_f.T
                 x = model.decoder(z)
                 assert x.shape == (1, n_x), f"Decoder output shape mismatch: {x.shape}"
-                preds.append(x.cpu().numpy()[0])  # Extract (n_x,) from (1, n_x)
+                preds.append(x.cpu().numpy()[0])
             preds = np.stack(preds, axis=0)
+        else:
+            raise ValueError(f"Unknown model type: {type(model)}. Must have predict_sequence or encoder+A_f+decoder.")
     
     assert preds.ndim == 2, f"preds must be 2D, got shape {preds.shape}"
     assert preds.shape == (n_steps + 1, n_x), f"preds shape mismatch: expected ({n_steps+1}, {n_x}), got {preds.shape}"
@@ -1384,10 +1444,34 @@ def main():
     # Create DataFrame
     results_df = pd.DataFrame(all_results)
     
-    # Reorder columns
-    cols_order = ['model', 'n_params', 'one_step_mse', 'one_step_mse_std',
-                  'nrmse_1step', 'nrmse_10step', 'nrmse_20step', 'nrmse_50step', 'nrmse_100step',
-                  'chamfer_distance', 'divergence_rate', 'reconstruction_error', 'spectral_radius']
+    # Reorder columns for readability
+    # Priority: model info, aggregate metrics, then per-dim/per-horizon details
+    eval_horizons = [1, 10, 20, 50, 100, 500, 1000]
+    n_x = all_results[0].get('n_x', 4) if all_results else 4
+    
+    cols_order = ['model', 'n_params', 'n_x', 'n_valid', 'n_total', 'n_diverged']
+    
+    # 1-step MSE (aggregate + per-dim)
+    cols_order += ['one_step_mse'] + [f'one_step_mse_dim{d}' for d in range(n_x)]
+    
+    # NRMSE at each horizon (aggregate + per-dim)
+    for h in eval_horizons:
+        cols_order += [f'nrmse_{h}step'] + [f'nrmse_{h}step_dim{d}' for d in range(n_x)]
+    
+    # Chamfer at each horizon
+    cols_order += [f'chamfer_{h}step' for h in eval_horizons]
+    
+    # Divergence at each horizon (aggregate + per-dim)
+    for h in eval_horizons:
+        cols_order += [f'divergence_{h}step'] + [f'divergence_{h}step_dim{d}' for d in range(n_x)]
+    
+    # Reconstruction error (aggregate + per-dim)
+    cols_order += ['reconstruction_error'] + [f'recon_error_dim{d}' for d in range(n_x)]
+    
+    # Spectral radius
+    cols_order += ['spectral_radius']
+    
+    # Apply ordering (keep only existing columns, append any extras)
     cols_order = [c for c in cols_order if c in results_df.columns]
     results_df = results_df[cols_order + [c for c in results_df.columns if c not in cols_order]]
     
@@ -1401,13 +1485,17 @@ def main():
     print("COMPARISON SUMMARY")
     print("="*80)
     if len(results_df) > 0 and 'model' in results_df.columns:
-        # Select columns that exist
-        summary_cols = ['model', 'n_params', 'one_step_mse', 'nrmse_50step', 'nrmse_100step']
+        # Select key columns for summary
+        summary_cols = ['model', 'n_params', 'one_step_mse', 
+                       'nrmse_100step', 'nrmse_500step', 'nrmse_1000step',
+                       'chamfer_100step', 'chamfer_1000step',
+                       'divergence_100step', 'n_diverged']
         available_cols = [c for c in summary_cols if c in results_df.columns]
         if available_cols:
             print(results_df[available_cols].to_string(index=False))
         else:
             print("No summary columns available")
+        print(f"\nFull results saved to CSV with {len(results_df.columns)} columns")
     else:
         print("No results to display")
     print("="*80)

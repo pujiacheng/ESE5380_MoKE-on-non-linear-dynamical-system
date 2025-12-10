@@ -60,12 +60,12 @@ EVAL_ONLY=false         # Set to true to skip training and only evaluate existin
 
 # Systems to train
 # SYSTEMS=("duffing" "vanderpol" "lorenz" "double_pendulum")
-SYSTEMS=("double_pendulum")
+SYSTEMS=("duffing" "vanderpol" "lorenz" "double_pendulum")
 
 # Models to train
 # Available: var, edmd, kae_baseline, advanced_kae, moe_2expert, moe_3expert, moe_4expert
 # MODELS=("var" "edmd" "kae_baseline" "advanced_kae" "moe_2expert" "moe_3expert" "moe_4expert")
-MODELS=("advanced_kae" "moe_2expert" "moe_3expert" "moe_4expert")
+MODELS=("var" "edmd" "kae_baseline" "advanced_kae" "moe_2expert" "moe_3expert" "moe_4expert")
 # =============================================================================
 # Print Configuration
 # =============================================================================

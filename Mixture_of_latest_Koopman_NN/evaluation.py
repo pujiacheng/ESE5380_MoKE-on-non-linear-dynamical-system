@@ -352,6 +352,46 @@ def long_horizon_divergence_rate(x_true, x_pred, plot=False):
     return float(slope), errors.cpu().numpy()
 
 
+def long_horizon_divergence_rate_per_dim(x_true, x_pred):
+    """
+    Compute divergence rate (exponential growth rate) per dimension.
+    
+    Fits log(|error_t|) = a*t + b for each dimension separately.
+    
+    Args:
+        x_true: (batch, T, d) true trajectories
+        x_pred: (batch, T, d) predicted trajectories
+    
+    Returns:
+        slopes: list of d floats, divergence rate per dimension
+        aggregate_slope: float, RMS of per-dim slopes
+    """
+    x_true = to_tensor(x_true)
+    x_pred = to_tensor(x_pred)
+    
+    n, T, d = x_true.shape
+    
+    t = torch.arange(T, dtype=torch.float32)
+    A = torch.stack([t, torch.ones_like(t)], dim=1)
+    
+    slopes = []
+    for dim in range(d):
+        # Per-dimension absolute error, averaged over batch
+        errors_dim = torch.abs(x_true[:, :, dim] - x_pred[:, :, dim]).mean(0)  # (T,)
+        errors_dim = errors_dim + 1e-8
+        log_err = torch.log(errors_dim)
+        
+        b = log_err.unsqueeze(1)
+        lstsq_result = torch.linalg.lstsq(A, b)
+        slope = lstsq_result.solution[0, 0].item()
+        slopes.append(slope)
+    
+    # RMS aggregate
+    aggregate_slope = np.sqrt(np.mean(np.array(slopes)**2))
+    
+    return slopes, aggregate_slope
+
+
 # -----------------------------------------------------------
 # Reconstruction metrics
 # -----------------------------------------------------------

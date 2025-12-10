@@ -19,12 +19,13 @@ class MLPEncoder(nn.Module):
 
     def __init__(self, n_in=2, n_latent=20, hidden=128):
         super().__init__()
+        # Using LayerNorm instead of BatchNorm for train/eval consistency
         self.net = nn.Sequential(
             nn.Linear(n_in, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, n_latent)
         )
@@ -38,12 +39,13 @@ class MLPDecoder(nn.Module):
 
     def __init__(self, n_latent=20, n_out=2, hidden=128):
         super().__init__()
+        # Using LayerNorm instead of BatchNorm for train/eval consistency
         self.net = nn.Sequential(
             nn.Linear(n_latent, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
             nn.Linear(hidden, n_out)
         )
@@ -67,6 +69,8 @@ class KoopmanAEBaseline(nn.Module):
     """
     def __init__(self, n_x=2, n_z=20):
         super().__init__()
+        self.n_x = n_x
+        self.n_z = n_z
         self.encoder = MLPEncoder(n_in=n_x, n_latent=n_z)
         self.decoder = MLPDecoder(n_latent=n_z, n_out=n_x)
         
