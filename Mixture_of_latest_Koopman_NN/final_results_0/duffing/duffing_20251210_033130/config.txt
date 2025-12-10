@@ -1,0 +1,15 @@
+System: duffing
+N Trajectories Total: 100000
+T: 10.0, dt: 0.01
+N Epochs: 150
+Patience: 20
+Batch Size: 2048
+
+--- Data Split (Trajectory-level) ---
+Train:      80000 trajectories (80%)
+Validation: 10000 trajectories (10%)
+Test:       10000 trajectories (10%)
+Train Samples: 80000
+Val Samples: 10000
+
+State Dim: 2, Latent Dim: 10
