@@ -1,0 +1,14 @@
+System: duffing
+N Trajectories Total: 100
+T: 10.0, dt: 0.01
+N Epochs: 150
+Patience: 20
+Batch Size: 2048
+
+--- Data Split (Trajectory-level) ---
+Mode: EVAL_ONLY (inference only)
+Test:       100 trajectories (100%)
+Train:      0 trajectories (not needed for eval)
+Validation: 0 trajectories (not needed for eval)
+
+State Dim: 2, Latent Dim: 10
